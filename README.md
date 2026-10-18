@@ -2,6 +2,8 @@
 
 An autonomous job-application agent that runs entirely on Cloudflare: Workers, D1, R2, Queues, Workflows, Cron Triggers, Browser Rendering (Playwright), Workers AI and Cloudflare Access. It uses no external databases, auth providers or AI vendors.
 
+**v2 — designed to be easy:** a 3-step onboarding (upload resume → confirm what you want → tick companies from a catalog of 75 verified boards) and then one daily loop: open **Today** (or the morning email), review what's prepared, approve. Vietnamese UI by default with an English toggle.
+
 ApplyPilot finds jobs on the boards you follow and scores them against your resume. It tailors an ATS-friendly resume for each role and drafts your application answers. It then fills the real application form in a headless browser, but **only submits after you approve**. Nothing is fabricated, and the AI never clicks buttons.
 
 ```
@@ -23,10 +25,23 @@ ApplyPilot finds jobs on the boards you follow and scores them against your resu
 | **Discovery** | Public Greenhouse, Lever and Ashby board APIs, plus any career page that publishes schema.org `JobPosting` JSON-LD (robots.txt enforced, same-origin, capped). Extracts the JD, salary (structured fields, then regex), location, workplace type, seniority and apply link. Deduplicates within a board and across boards; jobs that disappear are closed. One crawl per board serves every user. |
 | **Matching** | Hard filters run first (excluded companies and title keywords, remote policy, location, salary floor, visa sponsorship, seniority distance). A deterministic 0–100 score follows: skills 45, title 25, seniority 10, location 10, salary 10, plus an interests bonus. AI refines the JD analysis only for promising jobs (cached and shared), and re-scores only ambiguous 50–74 scores. |
 | **Resume tailoring** | A deterministic reorder (skills and bullets by relevance) always runs. AI rephrasing goes through a **fabrication guard**: it rejects new numbers, new tools or skills, promotional filler, high-novelty wording and over-long rewrites, and restores omitted bullets. Exports ATS-friendly PDF (pdf-lib, no browser) and DOCX. |
+| **Easy setup** | Onboarding wizard: resume import extracts contact details (regex, free) and suggests titles/level; company catalog (`shared/companies.json`, verified by `node scripts/verify-companies.mjs`); paste any company name or careers link and the ATS is detected automatically. |
+| **Daily loop** | 4 screens — Today, Jobs, Applications, Me. One "Prepare" button per job; "Skip" asks why (company / role / location / pay) and learns from it. Review screen shows only the questions that need you, autosaves, and approves with one confirmation. Auto mode prepares the best 3 matches per day; a 07:30 email digest (Cloudflare Email Service) links straight to the review screen. |
 | **Application agent** | Greenhouse adapter. The form schema comes from the public Job Board API, so preparation needs no browser time. Answers come from your profile, then your answer library, then AI (open-ended required questions only). Attestations, legal agreements, personal-history questions and preferences are always left for you. Playwright fills the form, uploads the tailored PDF, verifies every value persisted, and detects confirmation. |
 | **Safety** | Submission needs **(1)** your approval with a reviewed-answers checkbox, **(2)** `SUBMIT_MODE=live` on the deployment and **(3)** the live toggle in Settings. Dry-run mode blocks every non-GET request from the page, so nothing reaches the employer. Before the submit click, `clicked_at` is set by compare-and-set, so a retried step can never click twice. Duplicates are detected across postings. CAPTCHAs are detected and never bypassed: the application moves to *Needs you*. |
 | **Tracker** | Shortlisted → preparing → ready for review → approved → submitting → submitted → interview / offer / rejected / withdrawn, plus *Needs you* and *Failed*. Every transition is a compare-and-set write with an event-history entry. |
 | **Cost control** | Every AI call goes through one client: settings check → response cache (D1, 30 days) → budget gate → Workers AI (optional AI Gateway) → schema validation → token and cost accounting. Tasks degrade by priority: match reasoning stops at 60% of budget, JD analysis at 85%, tailoring and answers at 100%. Deterministic fallbacks always work. |
+
+### Job-board adapters
+
+| Board | Form read | Submission |
+|---|---|---|
+| Greenhouse | Job Board API (JSON) | Automated in browser after approval |
+| Ashby | Public GraphQL (queries only) | Automated in browser after approval |
+| Lever | Apply-page HTML | **Assisted**: answers prepared + copy buttons; you submit (Lever uses hCaptcha) |
+| Other / JSON-LD | — | Manual with tailored resume |
+
+All browser adapters share `worker/apply/browser-common.ts`: dry-run blocks every write request (GraphQL *queries* excepted), values are verified after filling, visible CAPTCHA stops the run, and submit is clicked at most once. A weekly canary (`worker/apply/health.ts`) dry-runs one real posting per adapter and flags DOM changes on the Today page.
 
 ## AI cost model
 
@@ -55,8 +70,11 @@ Other optimizations:
 npm install
 cp .dev.vars.example .dev.vars        # set DEV_USER_EMAIL and DATA_ENCRYPTION_KEY (openssl rand -base64 32)
 npm run db:migrate:local
-npm run dev                           # http://localhost:5173
+npm run dev                           # http://localhost:5173 (uses the local-only "dev" env)
+npm run test:e2e                      # browser engine vs. a local fixture form (dev server running)
 ```
+
+`npm run dev` runs the `env.dev` configuration (Worker name `applypilot-dev`, dev auth, simulated email) so Workers AI's remote dev proxy never goes through the Access-protected production hostname. Never deploy `env.dev`.
 
 - `AUTH_MODE=dev` is accepted only on `localhost` with `DEV_USER_EMAIL` set. Production always verifies the Cloudflare Access JWT.
 - Workers AI always runs remotely, even in local dev (`wrangler login` required), so it incurs real, tiny charges.
@@ -83,6 +101,10 @@ The script creates D1, R2 and the queues (plus DLQ), writes the `database_id`, g
 3. Keep `SUBMIT_MODE="dry_run"` until you have verified dry runs on the boards you use. Only then set `"live"`, redeploy, and enable live submission in Settings.
 
 **Back up `DATA_ENCRYPTION_KEY`.** Personal data in D1 and every file in R2 is encrypted with it.
+
+**Rotating the key:** set the old key as `DATA_ENCRYPTION_KEY_PREV`, put the new one in `DATA_ENCRYPTION_KEY`, deploy. Reads fall back to the old key and the daily job re-encrypts rows and files in batches; remove `_PREV` once the `key_rotation` log reports `done: true`.
+
+**Daily email digest (optional):** onboard a domain in Cloudflare Email Service, uncomment the `send_email` binding in `wrangler.jsonc`, set `DIGEST_FROM` (e.g. `digest@yourdomain.com`), deploy. Without it the digest is skipped; "Preview today's email" in Me → Automation still works.
 
 ### Plans & limits
 
@@ -112,7 +134,7 @@ test/              vitest unit tests
 
 ## Known limitations
 
-- **Automated submission covers Greenhouse only.** Lever, Ashby and JSON-LD jobs are discovered, scored and tailored, then marked for manual application with the tailored resume. New adapters plug into `workflows/prepare.ts` (`adapterFor`) and `workflows/submit.ts`.
+- **Automated submission covers Greenhouse and Ashby.** Lever is assisted (CAPTCHA); other boards are manual. New adapters register in `worker/apply/adapters.ts`.
 - Some Greenhouse boards use invisible reCAPTCHA. If a challenge appears, or no confirmation is detected after submitting, ApplyPilot stops and moves the application to *Needs you*. It never retries a click blindly.
 - Live submission has not been exercised against a real employer during development, by design. Every end-to-end test ran in dry-run mode, where outgoing requests are blocked.
 - LinkedIn, Indeed and other sites whose terms prohibit automation are intentionally unsupported.

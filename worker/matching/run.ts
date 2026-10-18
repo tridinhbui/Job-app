@@ -1,7 +1,7 @@
 import type { BaseResume, JobAnalysis, MatchReasons, Seniority, Workplace } from "../../shared/types";
 import { aiAllowed } from "../ai/client";
 import { aiAnalyzeJob, aiMatchReasoning } from "../ai/tasks";
-import { createApplication } from "../db/applications";
+import { createApplication, eventStmt } from "../db/applications";
 import { getProfile, setWatermark } from "../db/profile";
 import type { Env } from "../env";
 import { chunk, now, safeJson, uniq } from "../lib/util";
@@ -265,23 +265,33 @@ export async function runMatching(
 
   // Automation: shortlist strong matches (and optionally prepare them).
   if (settings.autoShortlistScore > 0) {
-    const created: string[] = [];
-    for (const k of toStore.filter((x) => x.score >= settings.autoShortlistScore).sort((a, b) => b.score - a.score)) {
-      const id = await createApplication(env, userId, k.row.id, k.row.dedupe_key, `Auto-shortlisted (score ${k.score})`);
-      if (id) created.push(id);
-    }
-    result.shortlisted = created.length;
-    // Auto-prepare (tailor + draft answers) is capped per day; submission always needs approval.
-    if (settings.autoPrepare && created.length) {
+    const strong = toStore.filter((x) => x.score >= settings.autoShortlistScore).sort((a, b) => b.score - a.score);
+    if (settings.autoPrepare) {
+      // Auto mode: only create applications for the few that will actually be prepared today,
+      // so the review list stays short. Capped per day via a synchronously written marker event
+      // (workflow status events land later, so counting those would let pages overshoot).
       const dayStart = new Date().setUTCHours(0, 0, 0, 0);
       const today = await env.DB.prepare(
-        "SELECT COUNT(*) AS n FROM application_events WHERE user_id = ? AND to_status = 'preparing' AND created_at >= ?",
+        "SELECT COUNT(*) AS n FROM application_events WHERE user_id = ? AND type = 'info' AND message = 'Auto-prepare started' AND created_at >= ?",
       )
         .bind(userId, dayStart)
         .first<{ n: number }>();
-      const room = Math.max(0, settings.autoPrepareDailyLimit - (today?.n ?? 0));
-      const batch = created.slice(0, room).map((id) => ({ id: `prep-${id}-auto`, params: { applicationId: id, userId } }));
-      if (batch.length) await env.PREPARE_WORKFLOW.createBatch(batch);
+      let room = Math.max(0, settings.autoPrepareDailyLimit - (today?.n ?? 0));
+      const picked: string[] = [];
+      for (const k of strong) {
+        if (room <= 0) break;
+        const id = await createApplication(env, userId, k.row.id, k.row.dedupe_key, `Auto-selected (score ${k.score})`);
+        if (!id) continue;
+        picked.push(id);
+        room--;
+      }
+      if (picked.length) {
+        await env.DB.batch(picked.map((id) => eventStmt(env, id, userId, "info", "Auto-prepare started")));
+        await env.PREPARE_WORKFLOW.createBatch(picked.map((id) => ({ id: `prep-${id}-auto`, params: { applicationId: id, userId } })));
+      }
+      result.shortlisted = picked.length;
+    } else {
+      for (const k of strong) if (await createApplication(env, userId, k.row.id, k.row.dedupe_key, `Auto-shortlisted (score ${k.score})`)) result.shortlisted++;
     }
   }
 

@@ -44,6 +44,8 @@ export const defaultPreferences = (): Preferences => ({
   excludedCompanies: [],
   interests: [],
   minScore: 40,
+  excludedLocations: [],
+  learned: { liked: [], disliked: [] },
 });
 
 export const defaultSettings = (budgetUsd = 10): UserSettings => ({
@@ -53,6 +55,7 @@ export const defaultSettings = (budgetUsd = 10): UserSettings => ({
   autoPrepare: false,
   autoPrepareDailyLimit: 5,
   liveSubmitEnabled: false,
+  digestEnabled: true,
 });
 
 /** Merge a stored (possibly older / partial) object over defaults so new fields always exist. */

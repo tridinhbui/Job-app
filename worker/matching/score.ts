@@ -182,6 +182,8 @@ export function hardFilter(
   if (prefs.workplace === "remote_or_hybrid" && workplace === "onsite") return "On-site only";
 
   const isRemote = workplace === "remote" || /\bremote\b/i.test(job.location ?? "");
+  const badLoc = prefs.excludedLocations.find((l) => l.trim() && job.location && !isRemote && job.location.toLowerCase().includes(lc(l)));
+  if (badLoc) return `Location excluded (${badLoc})`;
   const locPrefs = prefs.locations.filter((l) => l.trim() && lc(l) !== "remote");
   if (locPrefs.length && job.location && !isRemote && !locationMatches(job.location, locPrefs)) {
     return `Location (${job.location}) not in preferred locations`;
@@ -262,7 +264,15 @@ export function scoreJob(
   const interestHits = prefs.interests.filter((i) => i.trim() && jdGrams.has(tokenize(i).join(" ")));
   const bonus = Math.min(5, interestHits.length * 2.5);
 
-  const score = Math.round(clamp(skills + title + Math.max(0, seniority) + location + salary + bonus, 0, 100));
+  // Feedback learned from what you prepared vs. skipped for the role.
+  let feedback = 0;
+  if (prefs.learned.liked.length && titleSimilarity(job.title, prefs.learned.liked) >= 0.8) feedback += 5;
+  if (prefs.learned.disliked.length && titleSimilarity(job.title, prefs.learned.disliked) >= 0.8) {
+    feedback -= 15;
+    flags.push("Similar to roles you skipped");
+  }
+
+  const score = Math.round(clamp(skills + title + Math.max(0, seniority) + location + salary + bonus + feedback, 0, 100));
   return {
     score,
     reasons: {

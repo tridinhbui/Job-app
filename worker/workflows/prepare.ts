@@ -3,11 +3,11 @@ import type { FormField, JobAnalysis, PreparedAnswer, TailoredResume } from "../
 import { aiAllowed } from "../ai/client";
 import { aiAnswerQuestions, aiTailorResume } from "../ai/tasks";
 import { chooseOption, missingRequired, prepareDeterministicAnswers } from "../apply/answers";
-import { fetchGreenhouseForm, parseGreenhouseUrl } from "../apply/greenhouse-form";
+import { adapterFor } from "../apply/adapters";
 import { getApplication, logEvent, transition } from "../db/applications";
 import { getProfile } from "../db/profile";
 import type { Env, PrepareParams } from "../env";
-import { encryptJson } from "../lib/crypto";
+import { encryptJson, keyring } from "../lib/crypto";
 import { putPrivate, userKey } from "../lib/storage";
 import { errorMessage, now, truncate } from "../lib/util";
 import { analysisFor, candidateSummary, JOB_COLUMNS } from "../matching/run";
@@ -19,15 +19,6 @@ import { guardAiTailoring, tailorDeterministic } from "../resume/tailor";
 // Each step is idempotent and cached, so retries and re-runs do not repeat paid work.
 
 type JobRowForPrep = Parameters<typeof analysisFor>[2] & { apply_url: string; job_url: string; source_id: string };
-
-export function adapterFor(applyUrl: string): "greenhouse" | "manual" {
-  try {
-    const host = new URL(applyUrl).hostname;
-    return /(^|\.)greenhouse\.io$/.test(host) && parseGreenhouseUrl(applyUrl) ? "greenhouse" : "manual";
-  } catch {
-    return "manual";
-  }
-}
 
 const JOB_SELECT_PREP = `SELECT ${JOB_COLUMNS}, j.apply_url, j.job_url, j.source_id
   FROM jobs j LEFT JOIN job_analysis a ON a.job_id = j.id`;
@@ -136,13 +127,11 @@ export class PrepareApplicationWorkflow extends WorkflowEntrypoint<Env, PrepareP
     const env = this.env;
     const job = await loadJob(env, jobId);
     const adapter = adapterFor(job.apply_url);
-    if (adapter === "manual") {
+    if (!adapter.loadForm) {
       await env.DB.prepare("UPDATE applications SET form_json = NULL, answers_enc = NULL, missing_json = '[]' WHERE id = ?").bind(applicationId).run();
-      return { adapter, fields: 0, aiAnswered: 0, missing: [] as string[], note: "This board has no automation adapter yet — apply manually with the tailored resume." };
+      return { adapter: adapter.id, fields: 0, aiAnswered: 0, missing: [] as string[], note: "This job board has no form access yet — apply on the site with the tailored resume." };
     }
-
-    const gh = parseGreenhouseUrl(job.apply_url)!;
-    const fields: FormField[] = await fetchGreenhouseForm(gh.board, gh.jobId);
+    const fields: FormField[] = await adapter.loadForm(job.apply_url);
     const profile = await getProfile(env, userId);
     const { answers, needsAi } = prepareDeterministicAnswers(fields, {
       personal: profile.personal,
@@ -173,10 +162,10 @@ export class PrepareApplicationWorkflow extends WorkflowEntrypoint<Env, PrepareP
 
     const missing = missingRequired(answers);
     await env.DB.prepare("UPDATE applications SET form_json = ?, answers_enc = ?, missing_json = ?, updated_at = ? WHERE id = ?")
-      .bind(JSON.stringify(fields), await encryptJson(env.DATA_ENCRYPTION_KEY, answers), JSON.stringify(missing), now(), applicationId)
+      .bind(JSON.stringify(fields), await encryptJson(keyring(env), answers), JSON.stringify(missing), now(), applicationId)
       .run();
     if (note) await logEvent(env, applicationId, userId, "info", `AI answers skipped: ${note}`);
-    return { adapter, fields: fields.length, aiAnswered, missing, note };
+    return { adapter: adapter.id, fields: fields.length, aiAnswered, missing, note };
   }
 }
 
@@ -186,7 +175,7 @@ function summaryMessage(
 ) {
   const parts = [`Resume tailored (${t.method}).`];
   if (t.note) parts.push(`AI tailoring unavailable: ${t.note}.`);
-  if (f.adapter === "greenhouse") {
+  if (f.fields > 0) {
     parts.push(`${f.fields} form field(s) read; ${f.aiAnswered} drafted by AI.`);
     if (f.missing.length) parts.push(`${f.missing.length} required field(s) need your input.`);
   } else parts.push(f.note ?? "Manual application.");

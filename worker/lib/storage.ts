@@ -1,5 +1,5 @@
 import type { Env } from "../env";
-import { decryptBytes, encryptBytes } from "./crypto";
+import { decryptBytes, encryptBytes, keyring } from "./crypto";
 
 // All objects are stored encrypted and namespaced by user id: "u/<userId>/...".
 // Objects are only ever served through authenticated API routes that check ownership.
@@ -8,7 +8,7 @@ export const userKey = (userId: string, path: string) => `u/${userId}/${path}`;
 
 export async function putPrivate(env: Env, key: string, data: Uint8Array | string, contentType: string) {
   const bytes = typeof data === "string" ? new TextEncoder().encode(data) : data;
-  const enc = await encryptBytes(env.DATA_ENCRYPTION_KEY, bytes);
+  const enc = await encryptBytes(keyring(env), bytes);
   await env.FILES.put(key, enc, { customMetadata: { contentType, enc: "v1" } });
 }
 
@@ -16,7 +16,7 @@ export async function getPrivate(env: Env, key: string): Promise<{ bytes: Uint8A
   const obj = await env.FILES.get(key);
   if (!obj) return null;
   const raw = new Uint8Array(await obj.arrayBuffer());
-  const bytes = obj.customMetadata?.enc === "v1" ? await decryptBytes(env.DATA_ENCRYPTION_KEY, raw) : raw;
+  const bytes = obj.customMetadata?.enc === "v1" ? await decryptBytes(keyring(env), raw) : raw;
   return { bytes, contentType: obj.customMetadata?.contentType ?? "application/octet-stream" };
 }
 

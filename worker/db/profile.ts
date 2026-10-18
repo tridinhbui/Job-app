@@ -1,7 +1,7 @@
 import { defaultPreferences, defaultSettings, emptyPersonal, emptyResume, withDefaults } from "../../shared/defaults";
 import type { BaseResume, PersonalInfo, Preferences, UserSettings } from "../../shared/types";
 import type { Env } from "../env";
-import { decryptJson, encryptJson } from "../lib/crypto";
+import { decryptJson, encryptJson, keyring } from "../lib/crypto";
 import { now, safeJson, uuid } from "../lib/util";
 
 export interface SavedAnswer {
@@ -41,7 +41,7 @@ export async function ensureUser(env: Env, email: string): Promise<string> {
         `INSERT OR IGNORE INTO profiles (user_id, personal_enc, preferences_json, settings_json, updated_at)
          SELECT id, ?, ?, ?, ? FROM users WHERE email = ?`,
       ).bind(
-        await encryptJson(env.DATA_ENCRYPTION_KEY, personal),
+        await encryptJson(keyring(env), personal),
         JSON.stringify(defaultPreferences()),
         JSON.stringify(defaultSettings(Number(env.DEFAULT_MONTHLY_BUDGET_USD) || 10)),
         t,
@@ -72,7 +72,7 @@ export async function getProfile(env: Env, userId: string): Promise<Profile> {
     .bind(userId)
     .first<ProfileRow>();
   if (!row) throw new Error("Profile not found");
-  const key = env.DATA_ENCRYPTION_KEY;
+  const key = keyring(env);
   return {
     userId,
     personal: withDefaults(emptyPersonal(), await decryptJson(key, row.personal_enc, {})),
@@ -94,7 +94,7 @@ export async function getSettings(env: Env, userId: string): Promise<UserSetting
 
 export async function savePersonal(env: Env, userId: string, personal: PersonalInfo) {
   await env.DB.prepare("UPDATE profiles SET personal_enc = ?, updated_at = ? WHERE user_id = ?")
-    .bind(await encryptJson(env.DATA_ENCRYPTION_KEY, personal), now(), userId)
+    .bind(await encryptJson(keyring(env), personal), now(), userId)
     .run();
 }
 
@@ -103,7 +103,7 @@ export async function saveResume(env: Env, userId: string, resume: BaseResume): 
   const row = await env.DB.prepare(
     "UPDATE profiles SET resume_enc = ?, resume_version = resume_version + 1, match_watermark = 0, updated_at = ? WHERE user_id = ? RETURNING resume_version",
   )
-    .bind(await encryptJson(env.DATA_ENCRYPTION_KEY, resume), now(), userId)
+    .bind(await encryptJson(keyring(env), resume), now(), userId)
     .first<{ resume_version: number }>();
   return row?.resume_version ?? 0;
 }
@@ -122,7 +122,7 @@ export async function saveSettings(env: Env, userId: string, settings: UserSetti
 
 export async function saveAnswers(env: Env, userId: string, answers: SavedAnswer[]) {
   await env.DB.prepare("UPDATE profiles SET answers_enc = ?, updated_at = ? WHERE user_id = ?")
-    .bind(await encryptJson(env.DATA_ENCRYPTION_KEY, answers.slice(0, 300)), now(), userId)
+    .bind(await encryptJson(keyring(env), answers.slice(0, 300)), now(), userId)
     .run();
 }
 
@@ -131,4 +131,31 @@ export async function setWatermark(env: Env, userId: string, expected: number, w
   await env.DB.prepare("UPDATE profiles SET match_watermark = ? WHERE user_id = ? AND match_watermark = ?")
     .bind(watermark, userId, expected)
     .run();
+}
+
+export interface ProfileMeta {
+  locale: "vi" | "en";
+  timezone: string;
+  onboardedAt: number | null;
+}
+
+export async function getMeta(env: Env, userId: string): Promise<ProfileMeta> {
+  const row = await env.DB.prepare("SELECT locale, timezone, onboarded_at FROM profiles WHERE user_id = ?")
+    .bind(userId)
+    .first<{ locale: string; timezone: string; onboarded_at: number | null }>();
+  return { locale: row?.locale === "en" ? "en" : "vi", timezone: row?.timezone || "UTC", onboardedAt: row?.onboarded_at ?? null };
+}
+
+/**
+ * Update preferences from feedback without triggering a full re-match (unlike savePreferences).
+ * Learned lists are capped so they stay small.
+ */
+export async function patchPreferences(env: Env, userId: string, fn: (p: Preferences) => Preferences) {
+  const row = await env.DB.prepare("SELECT preferences_json FROM profiles WHERE user_id = ?").bind(userId).first<{ preferences_json: string }>();
+  const next = fn(withDefaults(defaultPreferences(), safeJson(row?.preferences_json, {})));
+  next.learned = { liked: next.learned.liked.slice(-50), disliked: next.learned.disliked.slice(-50) };
+  next.excludedCompanies = [...new Set(next.excludedCompanies)].slice(-300);
+  next.excludedLocations = [...new Set(next.excludedLocations)].slice(-50);
+  await env.DB.prepare("UPDATE profiles SET preferences_json = ?, updated_at = ? WHERE user_id = ?").bind(JSON.stringify(next), now(), userId).run();
+  return next;
 }

@@ -99,3 +99,22 @@ describe("candidate + scoring", () => {
     expect(hardFilter(job(), analysis, prefs, personal, cand)).toBeNull();
   });
 });
+
+describe("learned feedback", () => {
+  const cand = buildCandidate(resume);
+  const analysis = heuristicAnalysis({ title: "Senior Backend Engineer", description: JD, workplace: "remote", salary: null });
+  it("penalizes roles similar to skipped ones and boosts liked ones", () => {
+    const base = { ...defaultPreferences(), targetTitles: ["Backend Engineer"] };
+    const neutral = scoreJob(job(), analysis, cand, base).score;
+    const disliked = scoreJob(job(), analysis, cand, { ...base, learned: { liked: [], disliked: ["Senior Backend Engineer"] } });
+    const liked = scoreJob(job(), analysis, cand, { ...base, learned: { liked: ["Backend Engineer II"], disliked: [] } }).score;
+    expect(disliked.score).toBeLessThan(neutral);
+    expect(disliked.reasons.flags).toContain("Similar to roles you skipped");
+    expect(liked).toBeGreaterThanOrEqual(neutral);
+  });
+  it("hard-filters excluded locations for non-remote jobs only", () => {
+    const prefs = { ...defaultPreferences(), excludedLocations: ["London"] };
+    expect(hardFilter(job({ workplace: "onsite", location: "London, UK" }), { ...analysis, workplace: "onsite" }, prefs, personal, cand)).toMatch(/excluded/);
+    expect(hardFilter(job({ workplace: "remote", location: "London, UK" }), analysis, prefs, personal, cand)).toBeNull();
+  });
+});

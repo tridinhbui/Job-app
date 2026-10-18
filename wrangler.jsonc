@@ -58,8 +58,9 @@
   "browser": { "binding": "BROWSER" },
 
   "triggers": {
-    // :00 every 6h -> crawl sources; :45 -> match new jobs for users; 03:17 daily -> cleanup.
-    "crons": ["0 */6 * * *", "45 */6 * * *", "17 3 * * *"]
+    // :00 every 6h -> crawl; :45 -> match; :30 hourly -> daily digest at 07:30 local time;
+    // Mondays 04:05 -> adapter health canary (dry run); 03:17 daily -> cleanup.
+    "crons": ["0 */6 * * *", "45 */6 * * *", "30 * * * *", "5 4 * * 1", "17 3 * * *"]
   },
 
   "vars": {
@@ -73,6 +74,46 @@
     "AI_MODEL_FAST": "@cf/meta/llama-3.1-8b-instruct-fp8-fast",
     "AI_MODEL_QUALITY": "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
     "AI_GATEWAY_ID": "",
-    "DEFAULT_MONTHLY_BUDGET_USD": "10"
+    "DEFAULT_MONTHLY_BUDGET_USD": "10",
+    "APP_URL": "https://applypilot.tridinhbui0901.workers.dev",
+    // Daily digest sender. Requires a domain onboarded to Cloudflare Email Service and the
+    // "send_email" binding below; leave empty to disable email.
+    "DIGEST_FROM": ""
+  },
+  // "send_email": [{ "name": "EMAIL" }],
+
+  // Local development only (`npm run dev` sets CLOUDFLARE_ENV=dev). A separate Worker name
+  // keeps Workers AI's remote dev proxy off the Access-protected production hostname.
+  // Never deploy this environment.
+  "env": {
+    "dev": {
+      "name": "applypilot-dev",
+      "d1_databases": [{ "binding": "DB", "database_name": "applypilot", "database_id": "0b4f9d75-89e4-41d3-87bd-43c4d26ec1d1", "migrations_dir": "migrations" }],
+      "r2_buckets": [{ "binding": "FILES", "bucket_name": "applypilot-files" }],
+      "queues": {
+        "producers": [{ "binding": "JOBS_QUEUE", "queue": "applypilot-jobs" }],
+        "consumers": [{ "queue": "applypilot-jobs", "max_batch_size": 5, "max_batch_timeout": 5, "max_retries": 3, "dead_letter_queue": "applypilot-jobs-dlq" }]
+      },
+      "workflows": [
+        { "name": "applypilot-prepare", "binding": "PREPARE_WORKFLOW", "class_name": "PrepareApplicationWorkflow" },
+        { "name": "applypilot-submit", "binding": "SUBMIT_WORKFLOW", "class_name": "SubmitApplicationWorkflow" }
+      ],
+      "ai": { "binding": "AI", "remote": true },
+      "browser": { "binding": "BROWSER" },
+      "vars": {
+        "AUTH_MODE": "dev",
+        "ACCESS_TEAM_DOMAIN": "",
+        "ACCESS_AUD": "",
+        "SUBMIT_MODE": "dry_run",
+        "AI_MODEL_FAST": "@cf/meta/llama-3.1-8b-instruct-fp8-fast",
+        "AI_MODEL_QUALITY": "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+        "AI_GATEWAY_ID": "",
+        "DEFAULT_MONTHLY_BUDGET_USD": "10",
+        "APP_URL": "http://localhost:5173",
+        "DIGEST_FROM": "digest@applypilot.local"
+      },
+      // Simulated locally: emails are logged, never sent.
+      "send_email": [{ "name": "EMAIL" }]
+    }
   }
 }

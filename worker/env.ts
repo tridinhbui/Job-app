@@ -20,8 +20,16 @@ export interface Env {
   AI_GATEWAY_ID: string;
   DEFAULT_MONTHLY_BUDGET_USD: string;
 
+  /** Optional Email Service binding + sender for the daily digest (needs an onboarded domain). */
+  EMAIL?: { send(message: { to: string; from: string | { email: string; name?: string }; subject: string; html?: string; text?: string }): Promise<{ messageId: string }> };
+  DIGEST_FROM?: string;
+  /** Public URL of the dashboard, used for links in emails. */
+  APP_URL?: string;
+
   /** Secret: base64-encoded 32-byte key used for AES-GCM encryption of personal data. */
   DATA_ENCRYPTION_KEY: string;
+  /** Optional secret: the previous key during a rotation (decrypt-only). */
+  DATA_ENCRYPTION_KEY_PREV?: string;
 }
 
 export type QueueMessage =

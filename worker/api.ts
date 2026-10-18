@@ -1,17 +1,24 @@
 import { Hono } from "hono";
 import { z } from "zod";
 import { defaultPreferences, defaultSettings, emptyPersonal, emptyResume, withDefaults } from "../shared/defaults";
-import { SENIORITY_ORDER, type AppStatus, type FormField, type PreparedAnswer, type Seniority, type TailoredResume } from "../shared/types";
+import { SENIORITY_ORDER, type Ats, type AppStatus, type FormField, type PreparedAnswer, type Seniority, type TailoredResume } from "../shared/types";
 import { usageSummary } from "./ai/client";
+import { getSettings } from "./db/profile";
 import { missingRequired, normalizeQuestion } from "./apply/answers";
 import { authenticate } from "./auth";
+import { CATALOG } from "../shared/catalog";
 import { normalizeToken, probeBoard, sourceId } from "./discovery/crawl";
+import { detectSource } from "./discovery/detect";
+import { dev } from "./dev";
+import { digestData, emailConfigured, renderDigest } from "./email/digest";
 import { SourceError } from "./discovery/types";
 import { canTransition, createApplication, getApplication, logEvent, transition } from "./db/applications";
 import {
   ensureUser,
   forgetUser,
+  getMeta,
   getProfile,
+  patchPreferences,
   saveAnswers,
   savePersonal,
   savePreferences,
@@ -20,13 +27,13 @@ import {
   type SavedAnswer,
 } from "./db/profile";
 import type { Env } from "./env";
-import { decryptJson, encryptJson } from "./lib/crypto";
+import { decryptJson, encryptJson, keyring } from "./lib/crypto";
 import { deletePrefix, getPrivate, getPrivateJson } from "./lib/storage";
 import { errorMessage, HttpError, monthKey, now, safeJson } from "./lib/util";
 import { renderResumeDocx } from "./resume/docx";
 import { importResume } from "./resume/import";
 import { renderResumePdf } from "./resume/pdf";
-import { effectiveMode } from "./workflows/submit";
+import { effectiveMode, SUBMIT_ADAPTERS } from "./workflows/submit";
 
 type Vars = { userId: string; email: string };
 const api = new Hono<{ Bindings: Env; Variables: Vars }>().basePath("/api");
@@ -57,58 +64,118 @@ const strList = (max = 100, len = 200) => z.array(z.string().max(len)).max(max).
 
 api.get("/me", async (c) => {
   const userId = c.get("userId");
-  const usage = await usageSummary(c.env, userId);
-  return c.json({ email: c.get("email"), userId, submitMode: c.env.SUBMIT_MODE, usage });
+  const [usage, meta, settings] = await Promise.all([usageSummary(c.env, userId), getMeta(c.env, userId), getSettings(c.env, userId)]);
+  return c.json({
+    email: c.get("email"),
+    userId,
+    submitMode: c.env.SUBMIT_MODE,
+    liveSubmitEnabled: settings.liveSubmitEnabled,
+    usage,
+    locale: meta.locale,
+    timezone: meta.timezone,
+    onboarded: meta.onboardedAt != null,
+    emailConfigured: emailConfigured(c.env),
+  });
 });
 
-api.get("/overview", async (c) => {
+api.put("/profile/locale", async (c) => {
+  const { locale, timezone } = await body(c, z.object({ locale: z.enum(["vi", "en"]), timezone: z.string().max(64).optional() }));
+  const tz = timezone && isTimeZone(timezone) ? timezone : null;
+  await c.env.DB.prepare("UPDATE profiles SET locale = ?, timezone = COALESCE(?, timezone) WHERE user_id = ?").bind(locale, tz, c.get("userId")).run();
+  return c.json({ ok: true });
+});
+
+function isTimeZone(tz: string) {
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: tz });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// ---------------- today (home) ----------------
+
+api.get("/today", async (c) => {
   const userId = c.get("userId");
-  const weekAgo = now() - 7 * 24 * 3600 * 1000;
-  const [statusCounts, matchCounts, events, top, sources, usage, daily] = await Promise.all([
+  const threeDays = now() - 3 * 24 * 3600 * 1000;
+  const [todo, fresh, statusCounts, sources, health, usage] = await Promise.all([
+    c.env.DB.prepare(
+      `SELECT a.id, a.status, a.error, a.missing_json, a.updated_at, j.title, j.company, m.score
+       FROM applications a JOIN jobs j ON j.id = a.job_id LEFT JOIN matches m ON m.user_id = a.user_id AND m.job_id = a.job_id
+       WHERE a.user_id = ? AND a.status IN ('prepared','needs_manual','failed','preparing','approved','submitting')
+       ORDER BY CASE a.status WHEN 'prepared' THEN 0 WHEN 'needs_manual' THEN 1 WHEN 'failed' THEN 2 ELSE 3 END, m.score DESC LIMIT 20`,
+    )
+      .bind(userId)
+      .all<Record<string, unknown> & { missing_json: string | null }>(),
+    c.env.DB.prepare(
+      `SELECT m.job_id, m.score, m.reasons_json, j.title, j.company, j.location, j.workplace, j.salary_min, j.salary_max, j.salary_currency, j.salary_period
+       FROM matches m JOIN jobs j ON j.id = m.job_id LEFT JOIN applications a ON a.user_id = m.user_id AND a.job_id = m.job_id
+       WHERE m.user_id = ? AND m.dismissed = 0 AND j.status = 'open' AND a.id IS NULL AND m.created_at > ?
+       ORDER BY m.score DESC LIMIT 5`,
+    )
+      .bind(userId, threeDays)
+      .all<Record<string, unknown> & { reasons_json: string }>(),
     c.env.DB.prepare("SELECT status, COUNT(*) AS n FROM applications WHERE user_id = ? GROUP BY status").bind(userId).all<{ status: AppStatus; n: number }>(),
     c.env.DB.prepare(
-      `SELECT COUNT(*) AS total, SUM(CASE WHEN m.created_at > ? THEN 1 ELSE 0 END) AS week
-       FROM matches m JOIN jobs j ON j.id = m.job_id WHERE m.user_id = ? AND m.dismissed = 0 AND j.status = 'open'`,
-    )
-      .bind(weekAgo, userId)
-      .first<{ total: number; week: number | null }>(),
-    c.env.DB.prepare(
-      `SELECT e.id, e.type, e.to_status, e.message, e.created_at, e.application_id, j.title, j.company
-       FROM application_events e JOIN applications a ON a.id = e.application_id JOIN jobs j ON j.id = a.job_id
-       WHERE e.user_id = ? ORDER BY e.id DESC LIMIT 12`,
+      `SELECT s.id, s.company_name, s.last_status, s.last_error, s.last_crawled_at FROM sources s
+       JOIN user_sources us ON us.source_id = s.id WHERE us.user_id = ?`,
     )
       .bind(userId)
-      .all(),
-    c.env.DB.prepare(
-      `SELECT m.job_id, m.score, j.title, j.company, j.location, j.workplace FROM matches m JOIN jobs j ON j.id = m.job_id
-       LEFT JOIN applications a ON a.user_id = m.user_id AND a.job_id = m.job_id
-       WHERE m.user_id = ? AND m.dismissed = 0 AND j.status = 'open' AND a.id IS NULL ORDER BY m.score DESC LIMIT 6`,
-    )
-      .bind(userId)
-      .all(),
-    c.env.DB.prepare(
-      `SELECT s.id, s.ats, s.company_name, s.last_crawled_at, s.last_status, s.last_error, s.job_count
-       FROM sources s JOIN user_sources us ON us.source_id = s.id WHERE us.user_id = ? ORDER BY s.company_name`,
-    )
-      .bind(userId)
-      .all(),
+      .all<{ id: string; company_name: string; last_status: string | null; last_error: string | null; last_crawled_at: number | null }>(),
+    c.env.DB.prepare("SELECT ats, checked_at, fill_ratio, ok, message FROM adapter_health WHERE ok = 0").all(),
     usageSummary(c.env, userId),
-    c.env.DB.prepare(
-      `SELECT date(created_at / 1000, 'unixepoch') AS day, SUM(cost_usd) AS cost, COUNT(*) AS calls
-       FROM ai_usage WHERE user_id = ? AND created_at > ? GROUP BY day ORDER BY day`,
-    )
-      .bind(userId, now() - 30 * 24 * 3600 * 1000)
-      .all(),
   ]);
+  const totalMatches = await c.env.DB.prepare(
+    "SELECT COUNT(*) AS n FROM matches m JOIN jobs j ON j.id = m.job_id WHERE m.user_id = ? AND m.dismissed = 0 AND j.status = 'open'",
+  )
+    .bind(userId)
+    .first<{ n: number }>();
+
+  // Problems the user may need to act on, computed from existing state (no extra writes).
+  const incidents: { kind: string; message: string; ref?: string }[] = [];
+  for (const s of sources.results.filter((x) => x.last_status === "error" || x.last_status === "blocked")) {
+    incidents.push({ kind: "source", ref: s.id, message: `${s.company_name}: ${s.last_error ?? s.last_status}` });
+  }
+  for (const h of health.results as { ats: string; message: string | null }[]) {
+    incidents.push({ kind: "adapter", ref: h.ats, message: h.message ?? `${h.ats} form automation may be out of date` });
+  }
+  if (usage.mode === "exhausted") incidents.push({ kind: "budget", message: "AI budget reached — using deterministic fallbacks until next month" });
+
   return c.json({
+    todo: todo.results.map(({ missing_json, ...r }) => ({ ...r, missing: safeJson<string[]>(missing_json, []) })),
+    fresh: fresh.results.map(({ reasons_json, ...r }) => ({ ...r, reasons: safeJson(reasons_json, null) })),
     statusCounts: Object.fromEntries(statusCounts.results.map((r) => [r.status, r.n])),
-    matches: { total: matchCounts?.total ?? 0, week: matchCounts?.week ?? 0 },
-    events: events.results,
-    topMatches: top.results,
-    sources: sources.results,
+    totalMatches: totalMatches?.n ?? 0,
+    sources: { total: sources.results.length, crawled: sources.results.filter((x) => x.last_crawled_at).length },
+    incidents,
     usage,
-    daily: daily.results,
   });
+});
+
+/** What tomorrow's digest email would contain (also works when email isn't configured). */
+api.get("/digest/preview", async (c) => {
+  const userId = c.get("userId");
+  const meta = await getMeta(c.env, userId);
+  const msg = renderDigest(await digestData(c.env, userId, now() - 24 * 3600 * 1000), meta.locale, c.env.APP_URL ?? new URL(c.req.url).origin);
+  return c.html(msg ? msg.html : `<p style="font-family:sans-serif">${meta.locale === "vi" ? "Hôm nay chưa có gì mới để gửi." : "Nothing new to send today."}</p>`);
+});
+
+// ---------------- onboarding ----------------
+
+api.get("/onboarding/progress", async (c) => {
+  const userId = c.get("userId");
+  const row = await c.env.DB.prepare(
+    `SELECT
+       (SELECT COUNT(*) FROM user_sources WHERE user_id = ?1) AS sources,
+       (SELECT COUNT(*) FROM user_sources us JOIN sources s ON s.id = us.source_id WHERE us.user_id = ?1 AND s.last_crawled_at IS NOT NULL) AS crawled,
+       (SELECT COUNT(*) FROM jobs j JOIN user_sources us ON us.source_id = j.source_id WHERE us.user_id = ?1 AND j.status = 'open') AS jobs,
+       (SELECT COUNT(*) FROM matches WHERE user_id = ?1 AND dismissed = 0) AS matches,
+       (SELECT match_lease_until FROM profiles WHERE user_id = ?1) AS lease`,
+  )
+    .bind(userId)
+    .first<{ sources: number; crawled: number; jobs: number; matches: number; lease: number }>();
+  return c.json({ ...row, matching: (row?.lease ?? 0) > now() });
 });
 
 // ---------------- profile / settings ----------------
@@ -147,6 +214,8 @@ const PreferencesSchema = z.object({
   excludedCompanies: strList(200),
   interests: strList(50, 60),
   minScore: z.number().int().min(0).max(100).catch(40),
+  excludedLocations: strList(50, 100),
+  learned: z.object({ liked: strList(50, 200), disliked: strList(50, 200) }).catch({ liked: [], disliked: [] }),
 });
 
 const SettingsSchema = z.object({
@@ -156,6 +225,7 @@ const SettingsSchema = z.object({
   autoPrepare: z.boolean().catch(false),
   autoPrepareDailyLimit: z.number().int().min(0).max(50).catch(5),
   liveSubmitEnabled: z.boolean().catch(false),
+  digestEnabled: z.boolean().catch(true),
 });
 
 api.get("/profile", async (c) => {
@@ -181,6 +251,43 @@ api.put("/settings", async (c) => {
   await saveSettings(c.env, c.get("userId"), settings);
   return c.json({ ok: true, settings });
 });
+
+api.post("/onboarding/complete", async (c) => {
+  const userId = c.get("userId");
+  const input = await body(
+    c,
+    z.object({
+      personal: PersonalSchema.partial().catch({}),
+      preferences: PreferencesSchema.partial().catch({}),
+      timezone: z.string().max(64).optional(),
+      locale: z.enum(["vi", "en"]).catch("vi"),
+    }),
+  );
+  const profile = await getProfile(c.env, userId);
+  const personal = withDefaults(emptyPersonal(), { ...profile.personal, ...stripEmpty(input.personal) });
+  const prefs = withDefaults(defaultPreferences(), { ...profile.preferences, ...input.preferences });
+  // Sensible automation defaults: find + prepare the best few each day; never submit on its own.
+  const settings = {
+    ...profile.settings,
+    autoShortlistScore: profile.settings.autoShortlistScore || 75,
+    autoPrepare: true,
+    autoPrepareDailyLimit: profile.settings.autoPrepareDailyLimit || 3,
+    digestEnabled: true,
+  };
+  await savePersonal(c.env, userId, personal);
+  await savePreferences(c.env, userId, prefs);
+  await saveSettings(c.env, userId, settings);
+  const tz = input.timezone && isTimeZone(input.timezone) ? input.timezone : null;
+  await c.env.DB.prepare("UPDATE profiles SET onboarded_at = COALESCE(onboarded_at, ?), locale = ?, timezone = COALESCE(?, timezone) WHERE user_id = ?")
+    .bind(now(), input.locale, tz, userId)
+    .run();
+  await enqueueForce(c.env, userId);
+  await c.env.JOBS_QUEUE.send({ type: "match", userId, full: true }, { delaySeconds: 45 });
+  return c.json({ ok: true });
+});
+
+const stripEmpty = <T extends Record<string, unknown>>(o: T): Partial<T> =>
+  Object.fromEntries(Object.entries(o).filter(([, v]) => v !== "" && v !== undefined && !(Array.isArray(v) && v.length === 0))) as Partial<T>;
 
 api.put("/answers", async (c) => {
   const { answers } = await body(c, z.object({ answers: z.array(z.object({ question: str(500), answer: str(4000) })).max(300) }));
@@ -272,30 +379,66 @@ api.get("/sources", async (c) => {
 });
 
 api.post("/sources", async (c) => {
-  const input = await body(c, z.object({ ats: z.enum(["greenhouse", "lever", "ashby", "jsonld"]), token: z.string().min(1).max(500), companyName: str(120) }));
+  const input = await body(
+    c,
+    z.object({
+      query: z.string().max(500).optional(), // company name or any careers/board URL
+      ats: z.enum(["greenhouse", "lever", "ashby", "jsonld"]).optional(),
+      token: z.string().max(500).optional(),
+      companyName: str(120),
+    }),
+  );
+  let ats: Ats;
   let token: string;
+  let detectedName: string | undefined;
   try {
-    token = normalizeToken(input.ats, input.token);
+    if (input.query?.trim()) {
+      const d = await detectSource(input.query);
+      ats = d.ats;
+      token = normalizeToken(d.ats, d.token);
+      detectedName = d.name;
+    } else if (input.ats && input.token) {
+      ats = input.ats;
+      token = normalizeToken(input.ats, input.token);
+    } else throw new SourceError("Enter a company name or careers page link", false);
   } catch (e) {
     throw new HttpError(400, e instanceof SourceError ? e.message : "Invalid board URL or token");
   }
-  const id = sourceId(input.ats, token);
+  if (!input.companyName && detectedName) input.companyName = detectedName;
+  const id = sourceId(ats, token);
   const existing = await c.env.DB.prepare("SELECT id FROM sources WHERE id = ?").bind(id).first();
   if (!existing) {
     let info;
     try {
-      info = await probeBoard(input.ats, token);
+      info = await probeBoard(ats, token);
     } catch (e) {
       throw new HttpError(400, `Could not read that board: ${errorMessage(e)}`);
     }
     await c.env.DB.prepare("INSERT OR IGNORE INTO sources (id, ats, token, company_name, job_count, created_at) VALUES (?, ?, ?, ?, ?, ?)")
-      .bind(id, input.ats, token, input.companyName.trim() || info.companyName, info.jobCount, now())
+      .bind(id, ats, token, input.companyName.trim() || info.companyName, info.jobCount, now())
       .run();
   }
   await c.env.DB.prepare("INSERT OR IGNORE INTO user_sources (user_id, source_id, created_at) VALUES (?, ?, ?)").bind(c.get("userId"), id, now()).run();
   await c.env.JOBS_QUEUE.send({ type: "crawl", sourceId: id });
   await c.env.JOBS_QUEUE.send({ type: "match", userId: c.get("userId") }, { delaySeconds: 60 });
-  return c.json({ ok: true, id });
+  return c.json({ ok: true, id, ats, name: input.companyName || null });
+});
+
+/** Follow several catalog companies at once (catalog boards are pre-verified, so no probing). */
+api.post("/sources/catalog", async (c) => {
+  const userId = c.get("userId");
+  const { ids } = await body(c, z.object({ ids: z.array(z.string().max(120)).max(100) }));
+  const picked = CATALOG.filter((x) => ids.includes(`${x.ats}:${x.token}`));
+  if (!picked.length) return c.json({ ok: true, added: 0 });
+  const t = now();
+  await c.env.DB.batch(
+    picked.flatMap((x) => [
+      c.env.DB.prepare("INSERT OR IGNORE INTO sources (id, ats, token, company_name, created_at) VALUES (?, ?, ?, ?, ?)").bind(sourceId(x.ats, x.token), x.ats, x.token, x.name, t),
+      c.env.DB.prepare("INSERT OR IGNORE INTO user_sources (user_id, source_id, created_at) VALUES (?, ?, ?)").bind(userId, sourceId(x.ats, x.token), t),
+    ]),
+  );
+  await enqueueForce(c.env, userId);
+  return c.json({ ok: true, added: picked.length });
 });
 
 api.delete("/sources/:id", async (c) => {
@@ -346,6 +489,11 @@ api.get("/jobs", async (c) => {
     binds.push(q.workplace);
   }
   if (q.hideApplied === "1") where.push("a.id IS NULL");
+  if (q.all !== "1") {
+    // Postings older than 45 days rarely lead anywhere; hide them unless asked.
+    where.push("COALESCE(j.posted_at, j.first_seen_at) > ?");
+    binds.push(now() - 45 * 24 * 3600 * 1000);
+  }
   const order = q.sort === "recent" ? "j.first_seen_at DESC" : "m.score DESC, j.first_seen_at DESC";
   const rows = await c.env.DB.prepare(
     `SELECT m.job_id, m.score, m.det_score, m.ai_score, m.reasons_json, m.created_at AS matched_at,
@@ -400,11 +548,67 @@ api.post("/jobs/:id/shortlist", async (c) => {
 });
 
 api.post("/jobs/:id/dismiss", async (c) => {
-  await c.env.DB.prepare("UPDATE matches SET dismissed = 1, updated_at = ? WHERE user_id = ? AND job_id = ?")
-    .bind(now(), c.get("userId"), c.req.param("id"))
+  const userId = c.get("userId");
+  const { reason } = await body(c, z.object({ reason: z.enum(["company", "role", "location", "salary", "other"]).catch("other") }));
+  const job = await c.env.DB.prepare("SELECT title, company, location, workplace FROM jobs WHERE id = ?")
+    .bind(c.req.param("id"))
+    .first<{ title: string; company: string; location: string | null; workplace: string | null }>();
+  if (!job) throw new HttpError(404, "Job not found");
+  const t = now();
+  await c.env.DB.prepare("UPDATE matches SET dismissed = 1, skip_reason = ?, updated_at = ? WHERE user_id = ? AND job_id = ?")
+    .bind(reason, t, userId, c.req.param("id"))
     .run();
+  // Learn from the reason so similar jobs stop showing up.
+  if (reason === "company") {
+    await patchPreferences(c.env, userId, (p) => ({ ...p, excludedCompanies: [...p.excludedCompanies, job.company] }));
+    await c.env.DB.prepare(
+      "UPDATE matches SET dismissed = 1, skip_reason = 'company', updated_at = ? WHERE user_id = ? AND dismissed = 0 AND job_id IN (SELECT id FROM jobs WHERE company = ?)",
+    )
+      .bind(t, userId, job.company)
+      .run();
+  } else if (reason === "role") {
+    await patchPreferences(c.env, userId, (p) => ({ ...p, learned: { ...p.learned, disliked: [...p.learned.disliked, job.title] } }));
+  } else if (reason === "location" && job.location && job.workplace !== "remote") {
+    const place = job.location.split(/[;|]/)[0]!.split(",")[0]!.trim();
+    if (place) await patchPreferences(c.env, userId, (p) => ({ ...p, excludedLocations: [...p.excludedLocations, place] }));
+  }
   return c.json({ ok: true });
 });
+
+/** One click: shortlist (if needed) and start preparing. Also records the title as "liked". */
+api.post("/jobs/:id/prepare", async (c) => {
+  const userId = c.get("userId");
+  const job = await c.env.DB.prepare(
+    "SELECT j.id, j.title, j.dedupe_key FROM jobs j JOIN user_sources us ON us.source_id = j.source_id AND us.user_id = ? WHERE j.id = ?",
+  )
+    .bind(userId, c.req.param("id"))
+    .first<{ id: string; title: string; dedupe_key: string }>();
+  if (!job) throw new HttpError(404, "Job not found");
+  let appId = await createApplication(c.env, userId, job.id, job.dedupe_key, "Shortlisted");
+  if (!appId) {
+    const existing = await c.env.DB.prepare("SELECT id FROM applications WHERE user_id = ? AND (job_id = ? OR dedupe_key = ?)")
+      .bind(userId, job.id, job.dedupe_key)
+      .first<{ id: string }>();
+    appId = existing?.id ?? null;
+  }
+  if (!appId) throw new HttpError(409, "Could not create the application");
+  await patchPreferences(c.env, userId, (p) => ({ ...p, learned: { ...p.learned, liked: [...p.learned.liked, job.title] } }));
+  const workflowId = await startPrepare(c.env, userId, appId);
+  return c.json({ ok: true, id: appId, workflowId });
+});
+
+async function startPrepare(env: Env, userId: string, appId: string): Promise<string | null> {
+  const app = await getApplication(env, userId, appId);
+  if (!["shortlisted", "prepared", "failed", "needs_manual"].includes(app.status)) return app.workflow_id;
+  const instanceId = `prep-${app.id}-${app.updated_at}`;
+  try {
+    await env.PREPARE_WORKFLOW.create({ id: instanceId, params: { applicationId: app.id, userId } });
+  } catch (e) {
+    if (!/already exists/i.test(errorMessage(e))) throw e;
+  }
+  await env.DB.prepare("UPDATE applications SET workflow_id = ? WHERE id = ?").bind(instanceId, app.id).run();
+  return instanceId;
+}
 
 // ---------------- applications ----------------
 
@@ -451,7 +655,7 @@ api.get("/applications/:id", async (c) => {
     hasResume: !!app.resume_pdf_key,
     createdAt: app.created_at,
     updatedAt: app.updated_at,
-    answers: await decryptJson<PreparedAnswer[]>(c.env.DATA_ENCRYPTION_KEY, app.answers_enc, []),
+    answers: await decryptJson<PreparedAnswer[]>(keyring(c.env), app.answers_enc, []),
     missing: safeJson<string[]>(app.missing_json, []),
     form: safeJson<FormField[]>(app.form_json, []),
     tailored,
@@ -467,14 +671,7 @@ api.post("/applications/:id/prepare", async (c) => {
   if (!["shortlisted", "prepared", "failed", "needs_manual"].includes(app.status)) {
     throw new HttpError(409, `Cannot prepare an application that is ${app.status}`);
   }
-  const instanceId = `prep-${app.id}-${app.updated_at}`;
-  try {
-    await c.env.PREPARE_WORKFLOW.create({ id: instanceId, params: { applicationId: app.id, userId } });
-  } catch (e) {
-    if (!/already exists/i.test(errorMessage(e))) throw e; // double click: same instance id
-  }
-  await c.env.DB.prepare("UPDATE applications SET workflow_id = ? WHERE id = ?").bind(instanceId, app.id).run();
-  return c.json({ ok: true, workflowId: instanceId });
+  return c.json({ ok: true, workflowId: await startPrepare(c.env, userId, app.id) });
 });
 
 api.put("/applications/:id/answers", async (c) => {
@@ -485,10 +682,10 @@ api.put("/applications/:id/answers", async (c) => {
     c,
     z.object({
       answers: z.array(z.object({ key: z.string().max(100), value: z.union([z.string().max(8000), z.array(z.string().max(500)).max(30)]) })).max(200),
-      saveToLibrary: z.boolean().catch(false),
+      saveToLibrary: z.boolean().catch(true),
     }),
   );
-  const answers = await decryptJson<PreparedAnswer[]>(c.env.DATA_ENCRYPTION_KEY, app.answers_enc, []);
+  const answers = await decryptJson<PreparedAnswer[]>(keyring(c.env), app.answers_enc, []);
   const updates = new Map(input.answers.map((a) => [a.key, a.value]));
   const changed: PreparedAnswer[] = [];
   for (const a of answers) {
@@ -497,14 +694,14 @@ api.put("/applications/:id/answers", async (c) => {
     if (JSON.stringify(v) !== JSON.stringify(a.value)) {
       a.value = v;
       a.source = "user";
+      a.needsReview = false; // edited by the user
       changed.push(a);
     }
-    a.needsReview = false; // the user has seen and confirmed this answer
   }
   const missing = missingRequired(answers);
   await c.env.DB.prepare("UPDATE applications SET answers_enc = ?, missing_json = ?, error = ?, updated_at = ? WHERE id = ?")
     .bind(
-      await encryptJson(c.env.DATA_ENCRYPTION_KEY, answers),
+      await encryptJson(keyring(c.env), answers),
       JSON.stringify(missing),
       missing.length ? `Needs your input: ${missing.join("; ").slice(0, 400)}` : null,
       now(),
@@ -528,40 +725,82 @@ api.put("/applications/:id/answers", async (c) => {
   return c.json({ ok: true, missing });
 });
 
-api.post("/applications/:id/approve", async (c) => {
-  const userId = c.get("userId");
-  const input = await body(c, z.object({ mode: z.enum(["dry_run", "live"]), confirm: z.literal(true) }));
-  const app = await getApplication(c.env, userId, c.req.param("id"));
-  if (app.status !== "prepared") throw new HttpError(409, `Application must be prepared first (currently ${app.status})`);
-  if (app.adapter !== "greenhouse") throw new HttpError(409, "This job board has no automation adapter; apply manually and mark it submitted");
-  const answers = await decryptJson<PreparedAnswer[]>(c.env.DATA_ENCRYPTION_KEY, app.answers_enc, []);
+const AnswerUpdates = z.array(z.object({ key: z.string().max(100), value: z.union([z.string().max(8000), z.array(z.string().max(500)).max(30)]) })).max(200);
+
+/**
+ * Approve one prepared application. The confirmation dialog in the UI is the review step:
+ * final answers are saved and marked reviewed, then the submit workflow starts.
+ */
+async function approveApplication(env: Env, userId: string, appId: string, requested: "dry_run" | "live", updates?: z.infer<typeof AnswerUpdates>) {
+  const app = await getApplication(env, userId, appId);
+  if (app.status !== "prepared") throw new HttpError(409, `Application must be ready for review first (currently ${app.status})`);
+  if (!SUBMIT_ADAPTERS.has(app.adapter ?? "")) throw new HttpError(409, "This job board can't be submitted automatically; use assisted apply and mark it submitted");
+  const answers = await decryptJson<PreparedAnswer[]>(keyring(env), app.answers_enc, []);
+  const byKey = new Map((updates ?? []).map((u) => [u.key, u.value]));
+  for (const a of answers) {
+    const v = byKey.get(a.key);
+    if (v !== undefined && JSON.stringify(v) !== JSON.stringify(a.value)) {
+      a.value = v;
+      a.source = "user";
+    }
+    a.needsReview = false;
+  }
   const missing = missingRequired(answers);
   if (missing.length) throw new HttpError(409, `Fill the required fields first: ${missing.join("; ")}`);
-  if (answers.some((a) => a.needsReview)) throw new HttpError(409, "Review and save the answers before approving");
 
-  const profile = await getProfile(c.env, userId);
-  const mode = effectiveMode(c.env, input.mode, profile.settings.liveSubmitEnabled);
-  if (input.mode === "live" && mode !== "live") {
+  const profile = await getProfile(env, userId);
+  const mode = effectiveMode(env, requested, profile.settings.liveSubmitEnabled);
+  if (requested === "live" && mode !== "live") {
     throw new HttpError(
       409,
-      c.env.SUBMIT_MODE !== "live"
+      env.SUBMIT_MODE !== "live"
         ? "Live submission is disabled on this deployment (SUBMIT_MODE=dry_run). Run a dry run instead."
-        : "Enable live submission in Settings first.",
+        : "Enable live submission in settings first.",
     );
   }
-  const ok = await transition(c.env, app, ["prepared"], "approved", mode === "live" ? "Approved for submission by you" : "Approved for a dry run");
+  await env.DB.prepare("UPDATE applications SET answers_enc = ?, missing_json = '[]', error = NULL WHERE id = ?")
+    .bind(await encryptJson(keyring(env), answers), app.id)
+    .run();
+  const ok = await transition(env, app, ["prepared"], "approved", mode === "live" ? "Approved for submission by you" : "Approved for a dry run");
   if (!ok) throw new HttpError(409, "Application changed; reload and try again");
   const instanceId = `submit-${app.id}-${app.submit_attempts + 1}`;
   try {
-    await c.env.SUBMIT_WORKFLOW.create({ id: instanceId, params: { applicationId: app.id, userId, mode } });
+    await env.SUBMIT_WORKFLOW.create({ id: instanceId, params: { applicationId: app.id, userId, mode } });
   } catch (e) {
     if (!/already exists/i.test(errorMessage(e))) {
-      await transition(c.env, app, ["approved"], "prepared", "Could not start submission workflow");
+      await transition(env, app, ["approved"], "prepared", "Could not start submission workflow");
       throw e;
     }
   }
-  await c.env.DB.prepare("UPDATE applications SET workflow_id = ? WHERE id = ?").bind(instanceId, app.id).run();
-  return c.json({ ok: true, mode, workflowId: instanceId });
+  await env.DB.prepare("UPDATE applications SET workflow_id = ? WHERE id = ?").bind(instanceId, app.id).run();
+  return { mode, workflowId: instanceId };
+}
+
+api.post("/applications/:id/approve", async (c) => {
+  const input = await body(c, z.object({ mode: z.enum(["dry_run", "live"]), confirm: z.literal(true), answers: AnswerUpdates.optional() }));
+  return c.json({ ok: true, ...(await approveApplication(c.env, c.get("userId"), c.req.param("id"), input.mode, input.answers)) });
+});
+
+/**
+ * Approve several complete applications at once (only those with no AI-drafted or personal
+ * answers still waiting for review — those need individual attention).
+ */
+api.post("/applications/approve-batch", async (c) => {
+  const userId = c.get("userId");
+  const input = await body(c, z.object({ ids: z.array(z.string().max(64)).min(1).max(25), mode: z.enum(["dry_run", "live"]), confirm: z.literal(true) }));
+  const results: { id: string; ok: boolean; error?: string }[] = [];
+  for (const id of input.ids) {
+    try {
+      const app = await getApplication(c.env, userId, id);
+      const answers = await decryptJson<PreparedAnswer[]>(keyring(c.env), app.answers_enc, []);
+      if (answers.some((a) => a.needsReview)) throw new HttpError(409, "Has answers that need your review");
+      await approveApplication(c.env, userId, id, input.mode);
+      results.push({ id, ok: true });
+    } catch (e) {
+      results.push({ id, ok: false, error: errorMessage(e) });
+    }
+  }
+  return c.json({ results });
 });
 
 api.post("/applications/:id/status", async (c) => {
@@ -673,6 +912,9 @@ api.delete("/account", async (c) => {
   forgetUser(c.get("email"));
   return c.json({ ok: true });
 });
+
+// Local development only (see worker/dev.ts; returns 404 unless AUTH_MODE=dev on localhost).
+api.route("/dev", dev);
 
 api.all("*", (c) => c.json({ error: "Not found" }, 404));
 

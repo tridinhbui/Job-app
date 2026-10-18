@@ -109,6 +109,9 @@ export interface Preferences {
   excludedCompanies: string[];
   interests: string[]; // domains / keywords the user cares about
   minScore: number; // matches below this score are not stored
+  excludedLocations: string[]; // learned from "skip: location" (non-remote jobs only)
+  // Learned from feedback: titles of jobs you prepared (liked) or skipped for the role (disliked).
+  learned: { liked: string[]; disliked: string[] };
 }
 
 export interface UserSettings {
@@ -118,6 +121,17 @@ export interface UserSettings {
   autoPrepare: boolean;
   autoPrepareDailyLimit: number;
   liveSubmitEnabled: boolean;
+  digestEnabled: boolean;
+}
+
+export type Locale = "vi" | "en";
+export type SkipReason = "company" | "role" | "location" | "salary" | "other";
+
+export interface CatalogCompany {
+  name: string;
+  ats: Exclude<Ats, "jsonld">;
+  token: string;
+  category: string;
 }
 
 export type AppStatus =
@@ -183,7 +197,7 @@ export interface MatchReasons {
   concerns?: string[];
 }
 
-export type FieldType = "text" | "textarea" | "select" | "multiselect" | "file" | "location";
+export type FieldType = "text" | "textarea" | "select" | "multiselect" | "file" | "location" | "date";
 
 export interface FormField {
   key: string;

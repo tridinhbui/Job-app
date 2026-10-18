@@ -3,6 +3,9 @@ import { SourceError } from "./discovery/types";
 import type { Env, QueueMessage } from "./env";
 import { chunk, errorMessage, now } from "./lib/util";
 import { runMatching } from "./matching/run";
+import { sendDueDigests } from "./email/digest";
+import { reencryptBatch } from "./lib/rotate";
+import { probeAdapters } from "./apply/health";
 
 // Background processing: cron enqueues small, independent messages; the queue consumer
 // processes them with retries + DLQ. Each message does a bounded amount of work.
@@ -76,6 +79,7 @@ export async function enqueueDueMatches(env: Env) {
 }
 
 export async function dailyCleanup(env: Env) {
+  if (env.DATA_ENCRYPTION_KEY_PREV) console.log(JSON.stringify({ event: "key_rotation", ...(await reencryptBatch(env)) }));
   const t = now();
   const DAY = 24 * 3600 * 1000;
   await env.DB.batch([
@@ -97,6 +101,12 @@ export async function handleScheduled(controller: ScheduledController, env: Env)
       break;
     case "45 */6 * * *":
       console.log(JSON.stringify({ event: "cron_match", enqueued: await enqueueDueMatches(env) }));
+      break;
+    case "30 * * * *":
+      console.log(JSON.stringify({ event: "cron_digest", sent: await sendDueDigests(env) }));
+      break;
+    case "5 4 * * 1":
+      console.log(JSON.stringify({ event: "cron_adapter_health", results: await probeAdapters(env) }));
       break;
     default:
       await dailyCleanup(env);

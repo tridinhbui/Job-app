@@ -1,16 +1,19 @@
 import { WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep } from "cloudflare:workers";
 import type { PreparedAnswer } from "../../shared/types";
-import { runGreenhouseApplication } from "../apply/greenhouse-browser";
+import { ADAPTERS, adapterById } from "../apply/adapters";
 import { getApplication, logEvent, transition } from "../db/applications";
 import { getProfile } from "../db/profile";
 import type { Env, SubmitParams } from "../env";
-import { decryptJson } from "../lib/crypto";
+import { decryptJson, keyring } from "../lib/crypto";
 import { getPrivate, putPrivate, userKey } from "../lib/storage";
 import { errorMessage, now, truncate } from "../lib/util";
 
 // Submit = fill the real form in a browser and (live mode only) click submit, then verify.
 // Safety layers: user approval (status 'approved'), global SUBMIT_MODE, per-user live toggle,
 // duplicate detection, and a clicked_at compare-and-set so a retried step never clicks twice.
+
+/** Boards with a browser adapter that may click submit (others use assisted apply). */
+export const SUBMIT_ADAPTERS = new Set(ADAPTERS.filter((a) => a.mode === "automated").map((a) => a.id as string));
 
 export function effectiveMode(env: Env, requested: "dry_run" | "live", liveEnabled: boolean): "dry_run" | "live" {
   return requested === "live" && env.SUBMIT_MODE === "live" && liveEnabled ? "live" : "dry_run";
@@ -27,7 +30,7 @@ export class SubmitApplicationWorkflow extends WorkflowEntrypoint<Env, SubmitPar
       const mode = effectiveMode(env, event.payload.mode, profile.settings.liveSubmitEnabled);
       if (app.status === "submitting") return { ok: true, mode: (app.submit_mode as "dry_run" | "live") ?? mode, reason: "" };
       if (app.status !== "approved") return { ok: false, mode, reason: `Application is ${app.status}, not approved` };
-      if (app.adapter !== "greenhouse") return { ok: false, mode, reason: "No automation adapter for this job board" };
+      if (!SUBMIT_ADAPTERS.has(app.adapter ?? "")) return { ok: false, mode, reason: "No automation adapter for this job board" };
 
       const job = await env.DB.prepare("SELECT status FROM jobs WHERE id = ?").bind(app.job_id).first<{ status: string }>();
       if (job?.status !== "open") {
@@ -68,12 +71,14 @@ export class SubmitApplicationWorkflow extends WorkflowEntrypoint<Env, SubmitPar
             .bind(app.job_id)
             .first<{ apply_url: string; company: string; title: string }>();
           if (!job) throw new Error("Job not found");
-          const answers = await decryptJson<PreparedAnswer[]>(env.DATA_ENCRYPTION_KEY, app.answers_enc, []);
+          const answers = await decryptJson<PreparedAnswer[]>(keyring(env), app.answers_enc, []);
           const pdf = app.resume_pdf_key ? await getPrivate(env, app.resume_pdf_key) : null;
           if (!pdf) throw new Error("Tailored resume PDF is missing; re-run preparation");
           const name = `${profile.personal.firstName}_${profile.personal.lastName}_Resume.pdf`.replace(/[^\w.-]/g, "_");
 
-          const res = await runGreenhouseApplication(env, {
+          const runner = adapterById(app.adapter).run;
+          if (!runner) throw new Error(`No browser adapter for ${app.adapter}`);
+          const res = await runner(env, {
             applyUrl: job.apply_url,
             answers,
             resume: { name, bytes: pdf.bytes },

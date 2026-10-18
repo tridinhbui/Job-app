@@ -1,6 +1,7 @@
 import { Loader2, X } from "lucide-react";
 import { createContext, useCallback, useContext, useEffect, useState, type ReactNode } from "react";
 import type { AppStatus } from "../shared/types";
+import { useLocale } from "./i18n";
 
 export const cx = (...c: (string | false | null | undefined)[]) => c.filter(Boolean).join(" ");
 
@@ -153,26 +154,29 @@ export function ScoreBadge({ score }: { score: number }) {
   return <span className={cx("inline-flex h-8 w-10 items-center justify-center rounded-lg text-sm font-semibold text-white tabular-nums", tone)}>{score}</span>;
 }
 
-const STATUS_META: Record<AppStatus, { label: string; tone: "zinc" | "green" | "amber" | "red" | "blue" | "violet" }> = {
-  shortlisted: { label: "Shortlisted", tone: "zinc" },
-  preparing: { label: "Preparing", tone: "blue" },
-  prepared: { label: "Ready for review", tone: "violet" },
-  approved: { label: "Approved", tone: "blue" },
-  submitting: { label: "Submitting", tone: "blue" },
-  submitted: { label: "Submitted", tone: "green" },
-  needs_manual: { label: "Needs you", tone: "amber" },
-  failed: { label: "Failed", tone: "red" },
-  interview: { label: "Interview", tone: "violet" },
-  rejected: { label: "Rejected", tone: "zinc" },
-  offered: { label: "Offer", tone: "green" },
-  withdrawn: { label: "Withdrawn", tone: "zinc" },
+const STATUS_META: Record<AppStatus, { vi: string; en: string; tone: "zinc" | "green" | "amber" | "red" | "blue" | "violet" }> = {
+  shortlisted: { vi: "Đã lưu", en: "Saved", tone: "zinc" },
+  preparing: { vi: "Đang chuẩn bị", en: "Preparing", tone: "blue" },
+  prepared: { vi: "Chờ bạn duyệt", en: "Ready for review", tone: "violet" },
+  approved: { vi: "Đã duyệt", en: "Approved", tone: "blue" },
+  submitting: { vi: "Đang nộp", en: "Submitting", tone: "blue" },
+  submitted: { vi: "Đã nộp", en: "Applied", tone: "green" },
+  needs_manual: { vi: "Cần bạn xử lý", en: "Needs you", tone: "amber" },
+  failed: { vi: "Lỗi", en: "Failed", tone: "red" },
+  interview: { vi: "Phỏng vấn", en: "Interview", tone: "violet" },
+  rejected: { vi: "Bị từ chối", en: "Rejected", tone: "zinc" },
+  offered: { vi: "Có offer", en: "Offer", tone: "green" },
+  withdrawn: { vi: "Đã rút", en: "Withdrawn", tone: "zinc" },
 };
 
-export const statusLabel = (s: AppStatus) => STATUS_META[s]?.label ?? s;
+export function useStatusLabel() {
+  const { locale } = useLocale();
+  return (s: AppStatus) => STATUS_META[s]?.[locale] ?? s;
+}
 
 export function StatusBadge({ status }: { status: AppStatus }) {
-  const m = STATUS_META[status] ?? { label: status, tone: "zinc" as const };
-  return <Badge tone={m.tone}>{m.label}</Badge>;
+  const label = useStatusLabel();
+  return <Badge tone={STATUS_META[status]?.tone ?? "zinc"}>{label(status)}</Badge>;
 }
 
 export function Stat({ label, value, sub }: { label: string; value: ReactNode; sub?: ReactNode }) {
@@ -197,10 +201,52 @@ export function Empty({ icon, title, children, action }: { icon?: ReactNode; tit
 }
 
 export function Spinner({ label }: { label?: string }) {
+  const { locale } = useLocale();
   return (
     <div className="flex items-center justify-center gap-2 py-16 text-sm text-zinc-400">
       <Loader2 className="h-4 w-4 animate-spin" />
-      {label ?? "Loading"}
+      {label ?? (locale === "en" ? "Loading" : "Đang tải")}
+    </div>
+  );
+}
+
+/** Centered confirmation dialog. */
+export function Modal({ open, onClose, title, children, footer }: { open: boolean; onClose: () => void; title: ReactNode; children: ReactNode; footer: ReactNode }) {
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && onClose();
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [open, onClose]);
+  if (!open) return null;
+  return (
+    <div className="fixed inset-0 z-50 flex items-end justify-center p-4 sm:items-center">
+      <div className="absolute inset-0 bg-zinc-900/30" onClick={onClose} />
+      <div className="relative w-full max-w-lg rounded-2xl bg-white shadow-2xl">
+        <div className="px-6 pt-5 text-base font-semibold text-zinc-900">{title}</div>
+        <div className="scroll-thin max-h-[60vh] overflow-y-auto px-6 py-4 text-sm text-zinc-700">{children}</div>
+        <div className="flex flex-wrap justify-end gap-2 border-t border-zinc-100 px-6 py-3">{footer}</div>
+      </div>
+    </div>
+  );
+}
+
+/** Underlined tab bar. */
+export function Tabs<T extends string>({ tabs, value, onChange }: { tabs: { id: T; label: ReactNode }[]; value: T; onChange: (id: T) => void }) {
+  return (
+    <div className="scroll-thin mb-5 flex gap-1 overflow-x-auto border-b border-zinc-200">
+      {tabs.map((t) => (
+        <button
+          key={t.id}
+          onClick={() => onChange(t.id)}
+          className={cx(
+            "-mb-px flex shrink-0 items-center gap-1.5 border-b-2 px-3 py-2 text-sm transition",
+            value === t.id ? "border-zinc-900 font-medium text-zinc-900" : "border-transparent text-zinc-500 hover:text-zinc-800",
+          )}
+        >
+          {t.label}
+        </button>
+      ))}
     </div>
   );
 }

@@ -1,6 +1,6 @@
 import type { BaseResume, FormField, PersonalInfo, PreparedAnswer } from "../../shared/types";
 import type { SavedAnswer } from "../db/profile";
-import { totalYears } from "../matching/score";
+import { locationMatches, totalYears } from "../matching/score";
 import { tokenize } from "../matching/skills";
 
 // Deterministic answer engine. Handles the bulk of application questions from saved profile
@@ -81,7 +81,9 @@ function workAuth(label: string, ctx: AnswerContext): string | null {
   const alias = (c: string) => (c === "united states" ? ["united states", "u.s.", "us ", "usa"] : c === "united kingdom" ? ["united kingdom", "uk"] : [c]);
   if (countries.some((c) => alias(c).some((a) => l.includes(a)))) return "Yes";
   const mentionsCountry = /(united states|u\.s\.|usa|canada|united kingdom|\buk\b|germany|france|india|australia|ireland|netherlands|singapore|japan|country)/i.test(label);
-  if (mentionsCountry) return /country/i.test(label) && ctx.job.location && countries.some((c) => alias(c).some((a) => ctx.job.location!.toLowerCase().includes(a.trim()))) ? "Yes" : null;
+  // "...in the country where the job is located": answer from the job's location.
+  if (/country/i.test(label) && ctx.job.location && locationMatches(ctx.job.location, countries)) return "Yes";
+  if (mentionsCountry) return null;
   return null;
 }
 
@@ -104,7 +106,23 @@ function deterministic(field: FormField, ctx: AnswerContext): Omit<PreparedAnswe
     return v ? { value: v, source: "profile" as const, needsReview: false } : null;
   };
 
+  const fullName = `${p.firstName} ${p.lastName}`.trim();
+  const locationText = [p.city, p.region, p.country].filter(Boolean).join(", ");
   switch (field.key) {
+    // Ashby system fields / Lever standard fields
+    case "_systemfield_name":
+    case "name":
+      return profile(fullName);
+    case "_systemfield_email":
+      return profile(p.email);
+    case "_systemfield_resume":
+      return { value: "Tailored resume (PDF)", source: "file", needsReview: false };
+    case "_systemfield_location":
+      return profile(locationText);
+    case "org":
+      return profile(current(ctx.resume)?.company ?? "");
+    case "comments":
+      return null;
     case "first_name":
       return profile(p.firstName);
     case "last_name":
@@ -144,10 +162,17 @@ function deterministic(field: FormField, ctx: AnswerContext): Omit<PreparedAnswe
     if (v) return { value: v, source: "library", needsReview: false };
   }
   if (ATTESTATION.test(L) || ATTESTATION.test(field.description)) return null; // the user must answer attestations themselves
+  if (field.type === "date") return null; // dates (e.g. start date) are personal — the user picks one
+  if (field.type === "file") return null;
+
+  if (/^(full |legal )?name$/i.test(L.trim())) return profile(fullName);
+  if (/^e-?mail( address)?$/i.test(L.trim())) return profile(p.email);
+  if (/\bphone\b/i.test(L) && !field.options.length) return profile(p.phone);
 
   if (/linkedin/i.test(L)) return profile(p.linkedin);
   if (/github/i.test(L)) return profile(p.github);
   if (/website|portfolio|personal (site|url)|blog/i.test(L)) return profile(p.website || p.github);
+  if (/twitter|x\.com/i.test(L)) return null;
   if (/\baddress\b|where (do|will) you (plan|intend) to work|location (from which|you will work)/i.test(L) && !field.options.length) {
     return profile([p.city, p.region, p.country].filter(Boolean).join(", "), true);
   }
@@ -164,7 +189,7 @@ function deterministic(field: FormField, ctx: AnswerContext): Omit<PreparedAnswe
   const cur = current(ctx.resume);
   if (/current (company|employer)|most recent (company|employer)/i.test(L)) return profile(cur?.company ?? "");
   if (/current (job )?(title|role|position)/i.test(L)) return profile(cur?.title ?? "");
-  if (/years of (relevant |professional |industry )?experience/i.test(L)) {
+  if (/years of .{0,40}experience|years.{0,20}experience do you have/i.test(L)) {
     const years = totalYears(ctx.resume);
     if (field.options.length) {
       const b = yearsBucket(field, years);
@@ -195,18 +220,21 @@ export function prepareDeterministicAnswers(fields: FormField[], ctx: AnswerCont
     // required questions. Choices about facts, preferences or legal terms stay with the user.
     const openEnded = f.type === "textarea" || (f.type === "text" && !f.options.length);
     if (f.required && openEnded && !attestation && !personalFact && !preference && f.section === "main") needsAi.push(f);
+    const note = attestation
+      ? "Attestation — please answer this yourself"
+      : personalFact || preference
+        ? "Personal answer — only you can answer this (it will be remembered if you save it)"
+        : f.type === "date"
+          ? "Pick a date (YYYY-MM-DD)"
+          : f.type === "file"
+            ? "Upload not supported automatically"
+            : undefined;
     answers.push({
       ...base,
       value: f.type === "multiselect" ? [] : "",
       source: "none",
       needsReview: f.required,
-      note: attestation
-        ? "Attestation — please answer this yourself"
-        : personalFact || preference
-          ? "Personal answer — only you can answer this (it will be remembered if you save it)"
-          : f.type === "file"
-            ? "Upload not supported automatically"
-            : undefined,
+      note,
     });
   }
   return { answers, needsAi };
