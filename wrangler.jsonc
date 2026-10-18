@@ -65,8 +65,8 @@
   "vars": {
     // "access" validates the Cloudflare Access JWT. "dev" trusts DEV_USER_EMAIL (local only).
     "AUTH_MODE": "access",
-    "ACCESS_TEAM_DOMAIN": "",
-    "ACCESS_AUD": "",
+    "ACCESS_TEAM_DOMAIN": "hidden-snow-f3e6.cloudflareaccess.com",
+    "ACCESS_AUD": "b22278ef47a1cb2afc5194b4585fa933b188168ce032815562433eeec6b68bcd",
     // "dry_run" fills forms but never clicks submit. Must be set to "live" deliberately,
     // AND the user must enable live submission in Settings, AND approve each application.
     "SUBMIT_MODE": "dry_run",
