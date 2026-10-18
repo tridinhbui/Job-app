@@ -45,6 +45,7 @@ export interface ApplicationRow {
   confirmation_text: string | null;
   error: string | null;
   notes: string | null;
+  quality_json: string | null;
   created_at: number;
   updated_at: number;
 }

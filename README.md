@@ -32,6 +32,14 @@ ApplyPilot finds jobs on the boards you follow and scores them against your resu
 | **Tracker** | Shortlisted → preparing → ready for review → approved → submitting → submitted → interview / offer / rejected / withdrawn, plus *Needs you* and *Failed*. Every transition is a compare-and-set write with an event-history entry. |
 | **Cost control** | Every AI call goes through one client: settings check → response cache (D1, 30 days) → budget gate → Workers AI (optional AI Gateway) → schema validation → token and cost accounting. Tasks degrade by priority: match reasoning stops at 60% of budget, JD analysis at 85%, tailoring and answers at 100%. Deterministic fallbacks always work. |
 
+### v3: reliability & application intelligence
+
+- **No double submission, by construction.** Right before the submit click the engine must win `submission_locks (user, role)` and set `clicked_at` in one atomic D1 batch. Worker retries, timeouts, a browser that dies after clicking, concurrent approvals, duplicate postings of the same role and roles you marked "applied" by hand all hit the same lock. An unverified click can only be retried after you explicitly confirm it did not go through. The lock is released only when the site visibly rejected the form.
+- **Smarter matching.** Skills are scored by *evidence*: used in a recent role (1.0, fading to 0.7 for older roles), listed only (0.6) or absent. Relevant years are counted from roles similar to the target title. Seniority, experience, visa (stated / not stated), region-restricted remote, salary and a semantic resume↔job similarity (`bge-small` embeddings, cached per job and shared across users) all contribute. Weights: skills 30 · semantic 15 · title 15 · experience 10 · seniority 10 · location 10 · salary 10.
+- **Application quality report** on every prepared application. An independent fabrication audit checks that skills, roles, dates and numbers come from your original resume. Answers are checked for missing required fields, invalid options, length limits, placeholders, relevance and claims your resume doesn't support. Blocking issues prevent approval.
+- **Monitoring** (Me → Monitoring): discovery, preparation, form-fill and submission success rates, outcome breakdown, the most frequently failing fields, and AI cost per application (direct and all-in). It is backed by a `runs` log written by every crawl, match, prepare and submit.
+- **Full E2E on the real local stack:** `npm run test:e2e:full` (with `npm run dev` running) covers CV upload → discovery (real board) → matching → prepare → quality → dry run → live submit on a local fixture form → status, plus every duplicate scenario. It currently passes 25/25 checks.
+
 ### Job-board adapters
 
 | Board | Form read | Submission |
@@ -72,6 +80,7 @@ cp .dev.vars.example .dev.vars        # set DEV_USER_EMAIL and DATA_ENCRYPTION_K
 npm run db:migrate:local
 npm run dev                           # http://localhost:5173 (uses the local-only "dev" env)
 npm run test:e2e                      # browser engine vs. a local fixture form (dev server running)
+npm run test:e2e:full                 # whole flow on local D1/R2/Queues/Workflows, isolated test user
 ```
 
 `npm run dev` runs the `env.dev` configuration (Worker name `applypilot-dev`, dev auth, simulated email) so Workers AI's remote dev proxy never goes through the Access-protected production hostname. Never deploy `env.dev`.

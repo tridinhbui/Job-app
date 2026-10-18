@@ -7,6 +7,7 @@ import { api, fmtMoney, useApi } from "../api";
 import { timeAgoT, useT } from "../i18n";
 import { Badge, Button, Card, CardHeader, cx, ErrorNote, Field, inputCls, PageHeader, Progress, Spinner, TagInput, Tabs, Toggle, useToast } from "../ui";
 import { CompanyPicker } from "./CompanyPicker";
+import Monitoring from "./Monitoring";
 import ResumeEditor from "./ResumeEditor";
 
 interface ProfileResponse {
@@ -16,7 +17,7 @@ interface ProfileResponse {
   answers: { question: string; answer: string; updatedAt: number }[];
 }
 
-type TabId = "resume" | "profile" | "companies" | "automation" | "data";
+type TabId = "resume" | "profile" | "companies" | "automation" | "monitoring" | "data";
 
 function useSaver() {
   const toast = useToast();
@@ -465,6 +466,7 @@ export default function Me() {
     { id: "profile", label: t("Thông tin & mong muốn", "Profile & preferences") },
     { id: "companies", label: t("Công ty", "Companies") },
     { id: "automation", label: t("Tự động & AI", "Automation & AI") },
+    { id: "monitoring", label: t("Giám sát", "Monitoring") },
     { id: "data", label: t("Dữ liệu", "Data") },
   ];
   return (
@@ -475,6 +477,7 @@ export default function Me() {
       {tab === "resume" && <ResumeEditor />}
       {tab === "companies" && <CompaniesTab />}
       {tab === "data" && <DataTab />}
+      {tab === "monitoring" && <Monitoring />}
       {(tab === "profile" || tab === "automation") &&
         (loading || !data ? (
           <Spinner />

@@ -23,6 +23,9 @@ export async function authenticate(request: Request, env: Env): Promise<string> 
     if (!env.DEV_USER_EMAIL || !(host === "localhost" || host === "127.0.0.1")) {
       throw new HttpError(401, "Dev auth is only allowed on localhost with DEV_USER_EMAIL set");
     }
+    // E2E tests use an isolated throwaway user per run (dev mode on localhost only).
+    const override = request.headers.get("x-dev-user");
+    if (override && /^e2e-[\w.-]+@applypilot\.local$/.test(override)) return override.toLowerCase();
     return env.DEV_USER_EMAIL.toLowerCase();
   }
 

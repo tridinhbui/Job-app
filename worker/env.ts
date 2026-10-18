@@ -46,4 +46,6 @@ export interface SubmitParams {
   applicationId: string;
   userId: string;
   mode: "dry_run" | "live";
+  /** The user confirmed with the employer that an earlier, unverified attempt did NOT go through. */
+  confirmNotSubmitted?: boolean;
 }

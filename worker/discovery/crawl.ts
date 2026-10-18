@@ -1,5 +1,6 @@
 import type { Ats } from "../../shared/types";
 import type { Env } from "../env";
+import { logRun } from "../lib/runs";
 import { chunk, errorMessage, now, sha256Hex, truncate } from "../lib/util";
 import { seniorityFromTitle } from "../matching/analyze";
 import { ashbyBoard, ashbyJobs } from "./ashby";
@@ -92,6 +93,7 @@ export async function crawlSource(env: Env, id: string): Promise<CrawlResult> {
     await env.DB.prepare("UPDATE sources SET last_crawled_at = ?, last_status = ?, last_error = ? WHERE id = ?")
       .bind(t, permanent ? "blocked" : "error", truncate(errorMessage(e), 500), id)
       .run();
+    await logRun(env, { kind: "crawl", status: permanent ? "blocked" : "error", refId: id, startedAt: t, error: e });
     if (permanent) return { total: 0, inserted: 0, updated: 0, closed: 0 };
     throw e; // transient: let the queue retry with backoff
   }
@@ -199,5 +201,7 @@ export async function crawlSource(env: Env, id: string): Promise<CrawlResult> {
     .bind(t, "ok", suspiciousEmpty ? "Board returned 0 jobs; kept existing listings open" : null, seen.size, id)
     .run();
 
-  return { total: seen.size, inserted, updated, closed: toClose.length };
+  const result = { total: seen.size, inserted, updated, closed: toClose.length };
+  await logRun(env, { kind: "crawl", status: suspiciousEmpty ? "partial" : "ok", refId: id, startedAt: t, metrics: result });
+  return result;
 }

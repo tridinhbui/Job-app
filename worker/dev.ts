@@ -3,6 +3,7 @@ import type { PreparedAnswer } from "../shared/types";
 import { runGreenhouseApplication } from "./apply/greenhouse-browser";
 import type { Env } from "./env";
 import { HttpError } from "./lib/util";
+import { acquireSubmitLock } from "./workflows/submit";
 
 // Local-development-only routes (AUTH_MODE=dev on localhost): a fixture application form that
 // mimics Greenhouse's DOM, and an end-to-end check of the real browser engine against it.
@@ -45,6 +46,69 @@ dev.use("*", async (c, next) => {
 });
 
 dev.get("/fixture/greenhouse", (c) => c.html(FIXTURE));
+
+/** Greenhouse-style schema of the fixture form (read by the "fixture" adapter). */
+dev.get("/fixture/questions", (c) =>
+  c.json([
+    { key: "first_name", label: "First Name", type: "text", required: true, options: [], description: "", section: "main" },
+    { key: "last_name", label: "Last Name", type: "text", required: true, options: [], description: "", section: "main" },
+    { key: "email", label: "Email", type: "text", required: true, options: [], description: "", section: "main" },
+    { key: "resume", label: "Resume/CV", type: "file", required: false, options: [], description: "", section: "main" },
+    { key: "question_1", label: "Will you now or in the future require visa sponsorship?", type: "select", required: true, options: [{ label: "Yes", value: "1" }, { label: "No", value: "0" }], description: "", section: "main" },
+    { key: "question_2", label: "Why do you want to work at Fixture Labs?", type: "textarea", required: true, options: [], description: "", section: "main" },
+  ]),
+);
+
+dev.get("/fixture/submissions", (c) => c.json({ submissions }));
+
+/** Create a fixture job (followed by the caller) whose apply URL is the local fixture form. */
+dev.post("/fixture/job", async (c) => {
+  const body = (await c.req.json().catch(() => ({}))) as { dedupeKey?: string; title?: string; userEmail?: string };
+  const email = c.req.header("x-dev-user") ?? c.env.DEV_USER_EMAIL ?? "";
+  const user = await c.env.DB.prepare("SELECT id FROM users WHERE email = ?").bind(email.toLowerCase()).first<{ id: string }>();
+  if (!user) throw new HttpError(400, "Unknown user");
+  const t = Date.now();
+  const sourceId = "greenhouse:applypilot-fixture";
+  const id = crypto.randomUUID().replace(/-/g, "").slice(0, 24);
+  const title = body.title ?? "Senior Backend Engineer";
+  await c.env.DB.batch([
+    c.env.DB.prepare("INSERT OR IGNORE INTO sources (id, ats, token, company_name, created_at, last_status) VALUES (?, 'greenhouse', 'applypilot-fixture', 'Fixture Labs', ?, 'blocked')").bind(sourceId, t),
+    c.env.DB.prepare("INSERT OR IGNORE INTO user_sources (user_id, source_id, created_at) VALUES (?, ?, ?)").bind(user.id, sourceId, t),
+    c.env.DB.prepare(
+      `INSERT INTO jobs (id, source_id, external_id, company, title, location, workplace, seniority, description, apply_url, job_url, first_seen_at, updated_at, content_hash, dedupe_key)
+       VALUES (?, ?, ?, 'Fixture Labs', ?, 'San Francisco, CA', 'hybrid', 'senior', ?, ?, ?, ?, ?, ?, ?)`,
+    ).bind(
+      id,
+      sourceId,
+      id,
+      title,
+      "Requirements:\n- 5+ years building backend services in Python or Go\n- Kafka, PostgreSQL, Kubernetes on AWS",
+      `${new URL(c.req.url).origin}/api/dev/fixture/greenhouse`,
+      `${new URL(c.req.url).origin}/api/dev/fixture/greenhouse`,
+      t,
+      t,
+      id,
+      body.dedupeKey ?? `fixture labs|${id}`,
+    ),
+  ]);
+  return c.json({ id });
+});
+
+/** Inspect duplicate-protection state for an application. */
+dev.get("/fixture/state/:appId", async (c) => {
+  const app = await c.env.DB.prepare("SELECT id, user_id, status, clicked_at, submitted_at, dedupe_key FROM applications WHERE id = ?").bind(c.req.param("appId")).first<Record<string, unknown>>();
+  const lock = app ? await c.env.DB.prepare("SELECT application_id, locked_at FROM submission_locks WHERE user_id = ? AND dedupe_key = ?").bind(app.user_id, app.dedupe_key).first() : null;
+  return c.json({ app, lock });
+});
+
+/** Simulate the browser dying right after a click: the lock is taken, nothing is recorded. */
+dev.post("/fixture/simulate-click/:appId", async (c) => {
+  const app = await c.env.DB.prepare("SELECT user_id, dedupe_key FROM applications WHERE id = ?").bind(c.req.param("appId")).first<{ user_id: string; dedupe_key: string }>();
+  if (!app) throw new HttpError(404, "Not found");
+  const first = await acquireSubmitLock(c.env, app.user_id, c.req.param("appId"), app.dedupe_key);
+  const second = await acquireSubmitLock(c.env, app.user_id, c.req.param("appId"), app.dedupe_key);
+  return c.json({ first, second });
+});
 dev.post("/fixture/submit", (c) => {
   submissions++;
   return c.json({ ok: true, submissions });

@@ -18,14 +18,24 @@ interface Detail {
   error: string | null;
   notes: string | null;
   hasScreenshot: boolean;
+  clicked: boolean;
   hasResume: boolean;
   answers: PreparedAnswer[];
   missing: string[];
   form: FormField[];
+  quality: { score: number; blocking: number; warnings: number; checks: QualityCheck[] } | null;
   tailored: TailoredResume | null;
   job: { id: string; title: string; company: string; location: string | null; job_url: string; apply_url: string; status: string } | null;
   events: { id: number; type: string; to_status: AppStatus | null; message: string | null; created_at: number }[];
   globalSubmitMode: "dry_run" | "live";
+}
+
+interface QualityCheck {
+  id: string;
+  ok: boolean;
+  severity: "block" | "warn" | "info";
+  message: string;
+  field?: string;
 }
 
 const AUTOMATED = new Set(["greenhouse", "ashby"]);
@@ -99,6 +109,61 @@ function AnswerInput({ answer, field, value, onChange, disabled }: { answer: Pre
   );
 }
 
+function QualityCard({ q }: { q: NonNullable<Detail["quality"]> }) {
+  const t = useT();
+  const tail = (m: string) => m.split(": ").slice(1).join(": ") || m;
+  const text = (c: QualityCheck) => {
+    const vi: Record<string, string> = {
+      required: `Câu bắt buộc chưa trả lời: ${c.field ?? ""}`,
+      option: `${c.field}: lựa chọn không hợp lệ`,
+      placeholder: `${c.field}: còn chữ giữ chỗ (ví dụ [Company])`,
+      length: `${c.field}: quá dài cho ô một dòng`,
+      short: `${c.field}: câu trả lời quá ngắn`,
+      claims: `${c.field}: nhắc tới điều không có trong resume — ${tail(c.message)}`,
+      relevance: `${c.field}: có thể chưa trả lời đúng câu hỏi`,
+      duplicate: `${c.field}: trùng với câu trả lời khác`,
+      fabrication: c.ok ? "Resume chỉ chứa thông tin từ bản gốc của bạn" : `Resume: ${tail(c.message)}`,
+      contact: c.message.includes("email") ? "Hồ sơ thiếu email" : "Hồ sơ thiếu số điện thoại",
+      keywords: c.message.replace(/Covers (\d+) of the job's keywords/, "Bao phủ $1 từ khoá của tin tuyển dụng"),
+      answers: c.message.replace(/(\d+) answers checked/, "Đã kiểm tra $1 câu trả lời"),
+    };
+    return t(vi[c.id] ?? c.message, c.field && !c.message.includes(c.field) ? `${c.field}: ${c.message}` : c.message);
+  };
+  const problems = q.checks.filter((c) => !c.ok);
+  const passed = q.checks.filter((c) => c.ok);
+  const tone = q.blocking ? "border-red-200 bg-red-50/40" : q.warnings ? "border-amber-200 bg-amber-50/30" : "border-emerald-200 bg-emerald-50/30";
+  return (
+    <Card className={tone}>
+      <div className="flex items-center justify-between gap-3">
+        <h2 className="text-sm font-semibold">{t("Kiểm tra chất lượng", "Quality check")}</h2>
+        <span className={cx("rounded-md px-2 py-0.5 text-sm font-semibold tabular-nums", q.blocking ? "bg-red-600 text-white" : q.warnings ? "bg-amber-500 text-white" : "bg-emerald-600 text-white")}>
+          {q.blocking ? t(`${q.blocking} mục cần sửa`, `${q.blocking} to fix`) : `${q.score}/100`}
+        </span>
+      </div>
+      {problems.length > 0 && (
+        <ul className="mt-3 space-y-1.5 text-sm">
+          {problems.map((c, i) => (
+            <li key={i} className={cx("flex gap-2", c.severity === "block" ? "text-red-700" : "text-amber-800")}>
+              <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+              <span>{text(c)}</span>
+            </li>
+          ))}
+        </ul>
+      )}
+      {passed.length > 0 && (
+        <ul className="mt-3 space-y-1 text-xs text-emerald-800">
+          {passed.map((c, i) => (
+            <li key={i} className="flex gap-1.5">
+              <Check className="h-3.5 w-3.5 shrink-0" /> {text(c)}
+            </li>
+          ))}
+        </ul>
+      )}
+      {q.blocking > 0 && <p className="mt-3 text-xs text-red-700">{t("Cần sửa các mục màu đỏ trước khi duyệt.", "Fix the red items before approving.")}</p>}
+    </Card>
+  );
+}
+
 function CopyButton({ text }: { text: string }) {
   const t = useT();
   const [done, setDone] = useState(false);
@@ -133,6 +198,7 @@ export default function ReviewScreen() {
   const [confirm, setConfirm] = useState<null | "dry_run" | "live">(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [note, setNote] = useState("");
+  const [notSubmittedOk, setNotSubmittedOk] = useState(false);
   const pending = useRef<Record<string, string | string[]>>({});
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -155,12 +221,13 @@ export default function ReviewScreen() {
     try {
       await api(`/applications/${id}/answers`, { method: "PUT", json: { answers: Object.entries(changes).map(([key, value]) => ({ key, value })), saveToLibrary: true } });
       setSaving("saved");
+      void reload(true); // refresh the quality report
     } catch (e) {
       pending.current = { ...changes, ...pending.current };
       setSaving("idle");
       toast((e as Error).message, "error");
     }
-  }, [id, toast]);
+  }, [id, toast, reload]);
 
   const onChange = (key: string, v: string | string[]) => {
     setValues((s) => ({ ...s, [key]: v }));
@@ -204,7 +271,12 @@ export default function ReviewScreen() {
     try {
       await api(`/applications/${app.id}/approve`, {
         method: "POST",
-        json: { mode, confirm: true, answers: Object.entries({ ...values, ...pending.current }).map(([key, value]) => ({ key, value })) },
+        json: {
+          mode,
+          confirm: true,
+          confirmNotSubmitted: app.clicked && notSubmittedOk,
+          answers: Object.entries({ ...values, ...pending.current }).map(([key, value]) => ({ key, value })),
+        },
       });
       pending.current = {};
       setConfirm(null);
@@ -317,6 +389,8 @@ export default function ReviewScreen() {
             </div>
           </Card>
         )}
+
+        {app.quality && ["prepared", "needs_manual", "failed"].includes(app.status) && <QualityCard q={app.quality} />}
 
         {app.answers.length > 0 && (
           <Card>
@@ -456,6 +530,15 @@ export default function ReviewScreen() {
                 </>
               ) : (
                 <>
+                  {automated && app.status === "needs_manual" && (
+                    <Button
+                      variant="ghost"
+                      onClick={() => run("retry", () => api(`/applications/${app.id}/status`, { method: "POST", json: { status: "prepared", note: "Retry requested" } }), t("Đã mở lại để duyệt", "Reopened for review"))}
+                      loading={busy === "retry"}
+                    >
+                      {t("Thử lại", "Retry")}
+                    </Button>
+                  )}
                   <a href={app.job?.apply_url} target="_blank" rel="noreferrer">
                     <Button>
                       {t("Mở form", "Open form")} <ExternalLink className="h-3.5 w-3.5" />
@@ -480,7 +563,7 @@ export default function ReviewScreen() {
             <Button variant="ghost" onClick={() => setConfirm(null)}>
               {t("Xem lại", "Go back")}
             </Button>
-            <Button variant="primary" onClick={() => confirm && approve(confirm)} loading={busy === confirm}>
+            <Button variant="primary" onClick={() => confirm && approve(confirm)} loading={busy === confirm} disabled={confirm === "live" && app.clicked && !notSubmittedOk}>
               {confirm === "live" ? t("Xác nhận & nộp", "Confirm & submit") : t("Chạy thử", "Run dry run")}
             </Button>
           </>
@@ -493,6 +576,15 @@ export default function ReviewScreen() {
           <li>· {t(`Resume: ${app.tailorMethod === "ai" ? "điều chỉnh bằng AI (đã kiểm tra không bịa)" : "sắp xếp lại theo việc"}`, `Resume: ${app.tailorMethod === "ai" ? "AI-tailored (fabrication-checked)" : "reordered for the job"}`)}</li>
           <li>· {t(`${app.answers.length} câu trả lời${aiCount ? `, ${aiCount} do AI soạn` : ""}`, `${app.answers.length} answers${aiCount ? `, ${aiCount} drafted by AI` : ""}`)}</li>
         </ul>
+        {confirm === "live" && app.clicked && (
+          <label className="mt-3 flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 p-3 text-amber-900">
+            <input type="checkbox" className="mt-0.5" checked={notSubmittedOk} onChange={(e) => setNotSubmittedOk(e.target.checked)} />
+            {t(
+              "Lần trước đã bấm nộp nhưng không xác nhận được. Tôi đã kiểm tra email / trang tuyển dụng và chắc chắn hồ sơ CHƯA được nộp.",
+              "An earlier attempt clicked submit but couldn't be verified. I checked my email / the employer site and I'm sure it was NOT submitted.",
+            )}
+          </label>
+        )}
         <p className="mt-3 text-zinc-600">
           {confirm === "live"
             ? t("Bằng việc xác nhận, bạn xác nhận đã đọc các câu trả lời và chúng chính xác. ApplyPilot sẽ điền form và bấm nộp một lần, rồi kiểm tra trang xác nhận.", "By confirming you agree you've read the answers and they're accurate. ApplyPilot fills the form, clicks submit once, and checks for confirmation.")

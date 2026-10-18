@@ -115,7 +115,7 @@ function SkipMenu({ onSkip, disabled }: { onSkip: (r: SkipReason) => void; disab
   );
 }
 
-const BREAKDOWN_MAX = { skills: 45, title: 25, seniority: 10, location: 10, salary: 10 };
+const BREAKDOWN_MAX: Record<string, number> = { skills: 30, semantic: 15, title: 15, experience: 10, seniority: 10, location: 10, salary: 10 };
 
 function JobDrawer({ id, onClose, onChanged }: { id: string | null; onClose: () => void; onChanged: () => void }) {
   const t = useT();
@@ -126,9 +126,11 @@ function JobDrawer({ id, onClose, onChanged }: { id: string | null; onClose: () 
     void reload(true);
   });
   const r = job?.reasons;
-  const labels: Record<keyof typeof BREAKDOWN_MAX, string> = {
+  const labels: Record<string, string> = {
     skills: t("Kỹ năng", "Skills"),
+    semantic: t("Độ tương đồng", "Similarity"),
     title: t("Chức danh", "Title"),
+    experience: t("Kinh nghiệm", "Experience"),
     seniority: t("Cấp bậc", "Level"),
     location: t("Địa điểm", "Location"),
     salary: t("Lương", "Salary"),
@@ -179,16 +181,18 @@ function JobDrawer({ id, onClose, onChanged }: { id: string | null; onClose: () 
           {job.analysis?.summary && <p className="text-sm text-zinc-700">{job.analysis.summary}</p>}
           {r && (
             <section className="space-y-3">
-              <div className="grid grid-cols-5 gap-2">
-                {(Object.keys(BREAKDOWN_MAX) as (keyof typeof BREAKDOWN_MAX)[]).map((k) => (
-                  <div key={k} className="rounded-lg bg-zinc-50 px-2 py-2">
-                    <div className="truncate text-[11px] text-zinc-500">{labels[k]}</div>
-                    <div className="text-sm font-semibold tabular-nums">
-                      {r.breakdown[k]}
-                      <span className="font-normal text-zinc-400">/{BREAKDOWN_MAX[k]}</span>
+              <div className="grid grid-cols-4 gap-2 sm:grid-cols-7">
+                {Object.keys(BREAKDOWN_MAX)
+                  .filter((k) => typeof (r.breakdown as unknown as Record<string, number | null | undefined>)[k] === "number")
+                  .map((k) => (
+                    <div key={k} className="rounded-lg bg-zinc-50 px-2 py-2">
+                      <div className="truncate text-[11px] text-zinc-500">{labels[k]}</div>
+                      <div className="text-sm font-semibold tabular-nums">
+                        {(r.breakdown as unknown as Record<string, number>)[k]}
+                        <span className="font-normal text-zinc-400">/{BREAKDOWN_MAX[k]}</span>
+                      </div>
                     </div>
-                  </div>
-                ))}
+                  ))}
               </div>
               {r.rationale && <p className="rounded-lg border border-violet-100 bg-violet-50/50 px-3 py-2 text-sm text-zinc-700">{r.rationale}</p>}
               {r.matchedSkills.length > 0 && (

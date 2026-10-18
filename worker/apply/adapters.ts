@@ -12,7 +12,7 @@ import { fetchLeverForm, parseLeverUrl } from "./lever-form";
 //  - assisted:  form read so answers can be prepared, but the user submits (CAPTCHA'd sites).
 //  - manual:    no form access; the user applies with the tailored resume.
 
-export type AdapterId = "greenhouse" | "ashby" | "lever" | "manual";
+export type AdapterId = "greenhouse" | "ashby" | "lever" | "manual" | "fixture";
 
 interface Adapter {
   id: AdapterId;
@@ -50,6 +50,21 @@ export const ADAPTERS: Adapter[] = [
       return fetchAshbyForm(a.org, a.jobId);
     },
     run: runAshbyApplication,
+  },
+  {
+    // Local development only: the Greenhouse-like fixture form served by worker/dev.ts.
+    id: "fixture",
+    mode: "automated",
+    match: (url) => {
+      try {
+        const u = new URL(url);
+        return (u.hostname === "localhost" || u.hostname === "127.0.0.1") && u.pathname === "/api/dev/fixture/greenhouse";
+      } catch {
+        return false;
+      }
+    },
+    loadForm: async (url) => (await (await fetch(new URL("/api/dev/fixture/questions", url))).json()) as FormField[],
+    run: runGreenhouseApplication,
   },
   {
     id: "lever",

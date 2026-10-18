@@ -6,7 +6,8 @@ import { getProfile, setWatermark } from "../db/profile";
 import type { Env } from "../env";
 import { chunk, now, safeJson, uniq } from "../lib/util";
 import { heuristicAnalysis } from "./analyze";
-import { buildCandidate, hardFilter, scoreJob, type CandidateIndex, type ScoringJob } from "./score";
+import { buildCandidate, hardFilter, scoreJob, type CandidateIndex, type ScoreContext, type ScoringJob } from "./score";
+import { cosine, jobVectors, resumeVector, semanticFit } from "./embeddings";
 import { canonicalSkill } from "./skills";
 
 const PAGE = 150;
@@ -45,6 +46,7 @@ export interface MatchRunResult {
   shortlisted: number;
   more: boolean;
   cursor: MatchCursor | null;
+  embedded: number;
   skipped?: string;
 }
 
@@ -138,7 +140,7 @@ export async function runMatching(
   userId: string,
   opts: { full?: boolean; cursor?: MatchCursor | null } = {},
 ): Promise<MatchRunResult> {
-  const result: MatchRunResult = { evaluated: 0, stored: 0, filtered: 0, aiAnalyses: 0, aiReasoned: 0, shortlisted: 0, more: false, cursor: null };
+  const result: MatchRunResult = { evaluated: 0, stored: 0, filtered: 0, aiAnalyses: 0, aiReasoned: 0, shortlisted: 0, more: false, cursor: null, embedded: 0 };
   const profile = await getProfile(env, userId);
   if (!profile.resume.skills.length && !profile.resume.experience.length) {
     return { ...result, skipped: "no-resume" };
@@ -179,20 +181,37 @@ export async function runMatching(
   const lastRow = rows.results.at(-1);
   result.cursor = lastRow ? { t: lastRow.updated_at, id: lastRow.id } : cursor;
 
-  // Pass 1: deterministic filter + score.
+  // Pass 1: deterministic hard filters (free).
   type Scored = { row: JobRow; analysis: JobAnalysis; ai: boolean; score: number; det: number; aiScore: number | null; reasons: MatchReasons };
-  const kept: Scored[] = [];
+  const survivors: { row: JobRow; analysis: JobAnalysis; ai: boolean }[] = [];
   const dropIds: string[] = [];
   for (const row of rows.results) {
     const { analysis, ai } = await analysisFor(env, userId, row, false);
-    const job = toScoringJob(row);
-    const reject = hardFilter(job, analysis, prefs, profile.personal, cand);
-    if (reject) {
+    if (hardFilter(toScoringJob(row), analysis, prefs, profile.personal, cand)) {
       result.filtered++;
       dropIds.push(row.id);
       continue;
     }
-    const { score, reasons } = scoreJob(job, analysis, cand, prefs);
+    survivors.push({ row, analysis, ai });
+  }
+
+  // Semantic similarity for survivors (cached embeddings; budget-gated, optional).
+  const resumeVec = survivors.length ? await resumeVector(env, userId, profile.resume, profile.resumeVersion) : null;
+  const { vectors, embedded } = resumeVec ? await jobVectors(env, userId, survivors.map((s) => s.row)) : { vectors: new Map<string, number[]>(), embedded: 0 };
+  result.embedded = embedded;
+  const ctxFor = (jobId: string): ScoreContext => {
+    const v = vectors.get(jobId);
+    return {
+      requiresSponsorship: profile.personal.requiresSponsorship,
+      country: profile.personal.country,
+      semantic: resumeVec && v ? semanticFit(cosine(resumeVec, v)) : null,
+    };
+  };
+
+  // Pass 2: weighted score.
+  const kept: Scored[] = [];
+  for (const { row, analysis, ai } of survivors) {
+    const { score, reasons } = scoreJob(toScoringJob(row), analysis, cand, prefs, ctxFor(row.id));
     if (score < prefs.minScore - 10) {
       dropIds.push(row.id);
       continue;
@@ -216,7 +235,7 @@ export async function runMatching(
         k.score = -1; // newly revealed hard blocker (e.g. no sponsorship)
         continue;
       }
-      const s = scoreJob(job, res.analysis, cand, prefs);
+      const s = scoreJob(job, res.analysis, cand, prefs, ctxFor(k.row.id));
       Object.assign(k, { analysis: res.analysis, ai: true, score: s.score, det: s.score, reasons: { ...s.reasons, analysis: "ai" } });
     }
   }

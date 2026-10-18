@@ -20,6 +20,9 @@ export interface CandidateIndex {
   grams: Set<string>;
   years: number;
   titles: string[];
+  /** Per-role n-grams with a recency weight (1.0 = current/recent role). */
+  roles: { title: string; grams: Set<string>; weight: number; years: number }[];
+  projectGrams: Set<string>;
 }
 
 export interface ScoringJob {
@@ -73,13 +76,49 @@ export function resumeText(r: BaseResume): string {
   ].join("\n");
 }
 
-export function buildCandidate(resume: BaseResume): CandidateIndex {
+export function buildCandidate(resume: BaseResume, nowDate = new Date()): CandidateIndex {
+  const current = nowDate.getUTCFullYear() * 12 + nowDate.getUTCMonth();
+  const roles = resume.experience.map((e) => {
+    const start = ym(e.start);
+    const end = e.end ? ym(e.end) : current;
+    // Skills used recently count fully; evidence fades ~6% per year since the role ended, but
+    // never below 0.7 — real use always beats merely listing a skill (0.6).
+    const yearsAgo = end != null ? Math.max(0, (current - end) / 12) : 5;
+    return {
+      title: e.title,
+      grams: ngramSet(`${e.title}\n${e.bullets.join("\n")}`),
+      weight: Math.max(0.7, 1 - 0.06 * yearsAgo),
+      years: start != null && end != null && end >= start ? (end - start) / 12 : 0,
+    };
+  });
   return {
     skills: new Set(resume.skills.map((s) => canonicalSkill(s).toLowerCase())),
     grams: ngramSet(resumeText(resume)),
     years: totalYears(resume),
     titles: resume.experience.map((e) => e.title).filter(Boolean),
+    roles,
+    projectGrams: ngramSet(resume.projects.flatMap((p) => [p.name, ...p.bullets, p.skills.join(", ")]).join("\n")),
   };
+}
+
+/**
+ * How strongly the resume evidences a skill (0..1): used in a recent role > used in an older
+ * role > only listed in skills/projects > absent. Keyword presence alone is not full credit.
+ */
+export function skillEvidence(skill: string, cand: CandidateIndex): number {
+  const empty = new Set<string>();
+  let best = 0;
+  for (const r of cand.roles) if (r.weight > best && hasSkill(skill, empty, r.grams)) best = r.weight;
+  if (best > 0) return best;
+  if (hasSkill(skill, cand.skills, cand.projectGrams)) return 0.6;
+  return hasSkill(skill, empty, cand.grams) ? 0.5 : 0;
+}
+
+/** Years spent in roles similar to the target/job title (relevant experience). */
+export function relevantYears(cand: CandidateIndex, titles: string[]): number {
+  if (!titles.length) return cand.years;
+  const yrs = cand.roles.filter((r) => titleSimilarity(r.title, titles) >= 0.5).reduce((a, r) => a + r.years, 0);
+  return Math.round(Math.min(yrs, cand.years) * 10) / 10;
 }
 
 // ---------- titles ----------
@@ -202,39 +241,57 @@ export function hardFilter(
   return null;
 }
 
-export function scoreJob(
-  job: ScoringJob,
-  analysis: JobAnalysis,
-  cand: CandidateIndex,
-  prefs: Preferences,
-): { score: number; reasons: MatchReasons } {
+export interface ScoreContext {
+  requiresSponsorship?: boolean;
+  country?: string;
+  /** Semantic resume↔job fit (0..1) from embeddings; null when unavailable. */
+  semantic?: number | null;
+}
+
+/**
+ * Weighted, explainable score (0-100):
+ *   skills 30 (evidence-weighted) · semantic 15 · title 15 · experience 10 · seniority 10 ·
+ *   location 10 · salary 10 · plus interest bonus and learned feedback.
+ * Without an embedding the remaining 85 points are rescaled to 100.
+ */
+export function scoreJob(job: ScoringJob, analysis: JobAnalysis, cand: CandidateIndex, prefs: Preferences, ctx: ScoreContext = {}): { score: number; reasons: MatchReasons } {
   const flags: string[] = [];
 
-  // Skills (45)
+  // Skills (30): required count double; each skill weighted by how strongly the resume shows it.
   const required = analysis.requiredSkills.length ? analysis.requiredSkills : analysis.keywords;
   const nice = analysis.niceToHaveSkills.filter((s) => !required.includes(s));
-  const matchedReq = required.filter((s) => hasSkill(s, cand.skills, cand.grams));
-  const matchedNice = nice.filter((s) => hasSkill(s, cand.skills, cand.grams));
+  const evReq = required.map((s) => skillEvidence(s, cand));
+  const evNice = nice.map((s) => skillEvidence(s, cand));
+  const matchedReq = required.filter((_, i) => evReq[i]! > 0);
+  const matchedNice = nice.filter((_, i) => evNice[i]! > 0);
   const denom = required.length + 0.5 * nice.length;
-  const coverage = denom > 0 ? (matchedReq.length + 0.5 * matchedNice.length) / denom : 0.5;
-  const skills = 45 * coverage;
+  const coverage = denom > 0 ? (evReq.reduce((a, b) => a + b, 0) + 0.5 * evNice.reduce((a, b) => a + b, 0)) / denom : 0.5;
+  const skills = 30 * coverage;
+  const listedOnly = required.filter((_, i) => evReq[i]! > 0 && evReq[i]! <= 0.6);
+  if (listedOnly.length >= 2) flags.push(`Listed but not shown in your experience: ${listedOnly.slice(0, 3).join(", ")}`);
 
-  // Title (25)
+  // Title (15)
   const targets = prefs.targetTitles.length ? prefs.targetTitles : cand.titles.slice(0, 3);
-  const title = 25 * (targets.length ? titleSimilarity(job.title, targets) : 0.5);
+  const title = 15 * (targets.length ? titleSimilarity(job.title, targets) : 0.5);
 
-  // Seniority (10) + years gap penalty
+  // Experience (10): relevant years vs. what the posting asks for.
+  const relevant = relevantYears(cand, [job.title, ...targets]);
+  const effective = Math.max(relevant, cand.years * 0.6);
+  let experience = 7;
+  if (analysis.minYears != null) {
+    const gap = analysis.minYears - effective;
+    experience = gap <= 0 ? 10 : gap <= 1 ? 7 : gap <= 3 ? 3 : 0;
+    if (gap > 1) flags.push(`Asks for ${analysis.minYears}+ years (you have ~${Math.round(effective)} relevant)`);
+    if (effective > analysis.minYears + 8) flags.push("You may be overqualified for this level");
+  }
+
+  // Seniority (10)
   const jobSen = analysis.seniority ?? job.seniority;
   const wanted = prefs.seniority.length ? prefs.seniority : [inferSeniority(cand.years)];
   let seniority = 7;
   if (jobSen) {
     const d = Math.min(...wanted.map((w) => seniorityDistance(w, jobSen)));
     seniority = d === 0 ? 10 : d === 1 ? 6 : d === 2 ? 2 : 0;
-  }
-  if (analysis.minYears != null && analysis.minYears > cand.years + 1) {
-    const gap = analysis.minYears - cand.years;
-    seniority -= Math.min(10, 3 * gap);
-    flags.push(`Asks for ${analysis.minYears}+ years (you have ~${cand.years})`);
   }
 
   // Location / workplace (10)
@@ -245,6 +302,12 @@ export function scoreJob(
   else if (job.location && locPrefs.length && locationMatches(job.location, locPrefs)) location = 10;
   else if (!locPrefs.length && prefs.workplace === "any") location = 8;
   if (!workplace && prefs.workplace === "remote_only") flags.push("Remote policy not stated");
+  // "Remote — EU only" style restrictions that exclude the user's country.
+  const restricted = job.location?.match(/remote[^;|]*?\b(us|usa|united states|eu|europe|uk|canada|emea|apac|latam)\b/i)?.[1];
+  if (restricted && ctx.country && !locationMatches(restricted, [ctx.country]) && !locationMatches(ctx.country, [restricted])) {
+    location = Math.min(location, 3);
+    flags.push(`Remote limited to ${restricted.toUpperCase()}`);
+  }
 
   // Salary (10)
   let salary = prefs.minSalary ? 6 : 7;
@@ -252,12 +315,22 @@ export function scoreJob(
     if (job.salaryCurrency !== prefs.salaryCurrency) flags.push(`Salary in ${job.salaryCurrency}`);
     else {
       const annual = annualize({ min: job.salaryMin ?? job.salaryMax, max: job.salaryMax, period: (job.salaryPeriod as "year") ?? "year" });
-      salary = annual.max >= prefs.minSalary ? 10 : 4;
+      salary = annual.min >= prefs.minSalary ? 10 : annual.max >= prefs.minSalary ? 8 : 3;
       if (annual.max < prefs.minSalary) flags.push("Top of range is below your minimum");
     }
   }
 
+  // Visa
+  let visaAdj = 0;
   if (analysis.visaSponsorship === "no") flags.push("No visa sponsorship");
+  if (ctx.requiresSponsorship && analysis.visaSponsorship === "unknown") {
+    visaAdj = -4;
+    flags.push("Visa sponsorship not stated");
+  }
+  if (ctx.requiresSponsorship && analysis.visaSponsorship === "yes") flags.push("Sponsors visas");
+
+  // Semantic (15)
+  const semantic = ctx.semantic != null ? 15 * ctx.semantic : null;
 
   // Interests bonus (≤5)
   const jdGrams = ngramSet(`${job.title}\n${job.description.slice(0, 6000)}`);
@@ -272,7 +345,9 @@ export function scoreJob(
     flags.push("Similar to roles you skipped");
   }
 
-  const score = Math.round(clamp(skills + title + Math.max(0, seniority) + location + salary + bonus + feedback, 0, 100));
+  const base = skills + title + experience + seniority + location + salary;
+  const core = semantic != null ? base + semantic : (base / 85) * 100;
+  const score = Math.round(clamp(core + bonus + feedback + visaAdj, 0, 100));
   return {
     score,
     reasons: {
@@ -281,8 +356,10 @@ export function scoreJob(
       flags,
       breakdown: {
         skills: Math.round(skills),
+        semantic: semantic != null ? Math.round(semantic) : null,
         title: Math.round(title),
-        seniority: Math.max(0, Math.round(seniority)),
+        experience: Math.round(experience),
+        seniority: Math.round(seniority),
         location: Math.round(location),
         salary: Math.round(salary),
       },

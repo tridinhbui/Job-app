@@ -11,6 +11,7 @@
     "typecheck": "tsc -p tsconfig.worker.json --noEmit && tsc -p tsconfig.app.json --noEmit",
     "test": "vitest run",
     "test:e2e": "node scripts/e2e.mjs",
+    "test:e2e:full": "node scripts/e2e-full.mjs",
     "cf-typegen": "wrangler types worker/worker-configuration.d.ts",
     "db:migrate:local": "wrangler d1 migrations apply applypilot --local --env dev",
     "db:migrate:remote": "wrangler d1 migrations apply applypilot --remote"

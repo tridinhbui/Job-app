@@ -5,6 +5,7 @@ import { chunk, errorMessage, now } from "./lib/util";
 import { runMatching } from "./matching/run";
 import { sendDueDigests } from "./email/digest";
 import { reencryptBatch } from "./lib/rotate";
+import { logRun } from "./lib/runs";
 import { probeAdapters } from "./apply/health";
 
 // Background processing: cron enqueues small, independent messages; the queue consumer
@@ -20,7 +21,11 @@ export async function handleQueue(batch: MessageBatch<QueueMessage>, env: Env) {
         const r = await crawlSource(env, body.sourceId);
         console.log(JSON.stringify({ event: "crawl", sourceId: body.sourceId, ...r }));
       } else if (body.type === "match") {
+        const started = now();
         const r = await runMatching(env, body.userId, { full: body.full, cursor: body.cursor });
+        if (r.skipped !== "locked") {
+          await logRun(env, { kind: "match", status: r.skipped ? "skipped" : "ok", userId: body.userId, startedAt: started, metrics: { evaluated: r.evaluated, stored: r.stored, filtered: r.filtered, aiAnalyses: r.aiAnalyses, aiReasoned: r.aiReasoned, embedded: r.embedded } });
+        }
         console.log(JSON.stringify({ event: "match", userId: body.userId, ...r, cursor: undefined }));
         if (r.skipped === "locked") {
           // Another run is in progress. A full re-match must still happen afterwards; an
@@ -89,6 +94,7 @@ export async function dailyCleanup(env: Env) {
       "DELETE FROM jobs WHERE status = 'closed' AND closed_at < ? AND id NOT IN (SELECT job_id FROM applications)",
     ).bind(t - 45 * DAY),
     env.DB.prepare("DELETE FROM ai_usage WHERE created_at < ?").bind(t - 180 * DAY),
+    env.DB.prepare("DELETE FROM runs WHERE created_at < ?").bind(t - 90 * DAY),
     // Recover applications stuck mid-preparation (e.g. a workflow instance was terminated).
     env.DB.prepare("UPDATE applications SET status = 'failed', error = 'Preparation timed out', updated_at = ? WHERE status = 'preparing' AND updated_at < ?").bind(t, t - DAY),
   ]);

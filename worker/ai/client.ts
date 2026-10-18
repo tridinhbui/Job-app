@@ -43,6 +43,8 @@ export interface AiRequest<T> {
   schema: z.ZodType<T>;
   jsonSchema?: Record<string, unknown>;
   temperature?: number;
+  /** Attribute the spend to an application (monitoring: AI cost per application). */
+  applicationId?: string;
 }
 
 interface BudgetRow {
@@ -171,9 +173,9 @@ export async function runJson<T>(env: Env, req: AiRequest<T>): Promise<AiResult<
   // Account for the spend whether or not the output validates — it was billed either way.
   await env.DB.batch([
     env.DB.prepare(
-      `INSERT INTO ai_usage (user_id, month, task, model, input_tokens, output_tokens, cost_usd, estimated, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    ).bind(req.userId, month, req.task, req.model, inTok, outTok, cost, reported ? 0 : 1, now()),
+      `INSERT INTO ai_usage (user_id, month, task, model, input_tokens, output_tokens, cost_usd, estimated, created_at, application_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).bind(req.userId, month, req.task, req.model, inTok, outTok, cost, reported ? 0 : 1, now(), req.applicationId ?? null),
     env.DB.prepare(
       `INSERT INTO ai_budget (user_id, month, spent_usd, calls) VALUES (?, ?, ?, 1)
        ON CONFLICT (user_id, month) DO UPDATE SET spent_usd = spent_usd + excluded.spent_usd, calls = calls + 1`,

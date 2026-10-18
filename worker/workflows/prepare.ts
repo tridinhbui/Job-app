@@ -4,6 +4,9 @@ import { aiAllowed } from "../ai/client";
 import { aiAnswerQuestions, aiTailorResume } from "../ai/tasks";
 import { chooseOption, missingRequired, prepareDeterministicAnswers } from "../apply/answers";
 import { adapterFor } from "../apply/adapters";
+import { unsupportedClaims } from "../apply/quality";
+import { refreshQuality } from "../apply/quality-store";
+import { logRun } from "../lib/runs";
 import { getApplication, logEvent, transition } from "../db/applications";
 import { getProfile } from "../db/profile";
 import type { Env, PrepareParams } from "../env";
@@ -53,7 +56,7 @@ export class PrepareApplicationWorkflow extends WorkflowEntrypoint<Env, PrepareP
       });
 
       const tailored = await step.do("tailor-resume", { retries: { limit: 2, delay: "10 seconds", backoff: "exponential" }, timeout: "3 minutes" }, async () =>
-        this.tailor(userId, start.jobId, analysis),
+        this.tailor(userId, applicationId, start.jobId, analysis),
       );
 
       const form = await step.do("prepare-answers", { retries: { limit: 2, delay: "15 seconds", backoff: "exponential" }, timeout: "3 minutes" }, async () =>
@@ -62,13 +65,34 @@ export class PrepareApplicationWorkflow extends WorkflowEntrypoint<Env, PrepareP
 
       await step.do("finish", async () => {
         const app = await getApplication(env, userId, applicationId);
-        await transition(env, app, ["preparing"], "prepared", summaryMessage(tailored, form), {
+        const moved = await transition(env, app, ["preparing"], "prepared", summaryMessage(tailored, form), {
           tailored_key: tailored.jsonKey,
           resume_pdf_key: tailored.pdfKey,
           tailor_method: tailored.method,
           adapter: form.adapter,
           error: form.missing.length ? `Needs your input: ${truncate(form.missing.join("; "), 400)}` : null,
         });
+        const quality = await refreshQuality(env, await getApplication(env, userId, applicationId), { withResume: true });
+        if (moved) {
+          const cost = await env.DB.prepare("SELECT COALESCE(SUM(cost_usd), 0) AS c FROM ai_usage WHERE application_id = ?").bind(applicationId).first<{ c: number }>();
+          await logRun(env, {
+            kind: "prepare",
+            status: "ok",
+            userId,
+            refId: applicationId,
+            startedAt: event.timestamp.getTime(),
+            metrics: {
+              adapter: form.adapter,
+              tailorMethod: tailored.method,
+              fields: form.fields,
+              aiAnswered: form.aiAnswered,
+              missing: form.missing.length,
+              qualityScore: quality.report.score,
+              blocking: quality.report.blocking,
+              aiCostUsd: cost?.c ?? 0,
+            },
+          });
+        }
       });
       return { ok: true };
     } catch (e) {
@@ -77,12 +101,13 @@ export class PrepareApplicationWorkflow extends WorkflowEntrypoint<Env, PrepareP
         await transition(env, app, ["preparing"], "failed", `Preparation failed: ${truncate(errorMessage(e), 300)}`, {
           error: truncate(errorMessage(e), 500),
         });
+        await logRun(env, { kind: "prepare", status: "error", userId, refId: applicationId, startedAt: event.timestamp.getTime(), error: e });
       });
       throw e;
     }
   }
 
-  private async tailor(userId: string, jobId: string, analysis: JobAnalysis) {
+  private async tailor(userId: string, applicationId: string, jobId: string, analysis: JobAnalysis) {
     const env = this.env;
     const profile = await getProfile(env, userId);
     const job = await loadJob(env, jobId);
@@ -103,7 +128,7 @@ export class PrepareApplicationWorkflow extends WorkflowEntrypoint<Env, PrepareP
         company: job.company,
         keywords,
         description: job.description,
-      });
+      }, applicationId);
       if (ai.ok) result = guardAiTailoring(profile.resume, ai.data, deterministic);
       else note = ai.message;
     }
@@ -146,7 +171,7 @@ export class PrepareApplicationWorkflow extends WorkflowEntrypoint<Env, PrepareP
       const res = await aiAnswerQuestions(env, userId, needsAi.slice(0, 12), {
         candidate: `${candidateSummary(profile.resume, buildCandidate(profile.resume))}\nLocation: ${[profile.personal.city, profile.personal.country].filter(Boolean).join(", ")}`,
         job: `${job.title} at ${job.company} (${job.location ?? "n/a"})\n${analysis.summary}\n${truncate(job.description, 2500)}`,
-      });
+      }, applicationId);
       if (res.ok) {
         for (const r of res.data.answers) {
           const field = needsAi.find((f) => f.key === r.key);
@@ -154,7 +179,10 @@ export class PrepareApplicationWorkflow extends WorkflowEntrypoint<Env, PrepareP
           if (!field || !target || !r.confident || !r.answer.trim()) continue;
           const value = field.options.length ? chooseOption(field.options, r.answer) : r.answer.trim();
           if (!value) continue;
-          Object.assign(target, { value, source: "ai", needsReview: true, note: "AI draft — review before approving" } satisfies Partial<PreparedAnswer>);
+          // Flag (don't silently keep) drafts that mention facts the resume doesn't contain.
+          const claims = typeof value === "string" ? unsupportedClaims(value, profile.resume) : [];
+          const note = claims.length ? `AI draft mentions things not in your resume (${claims.slice(0, 4).join(", ")}) — edit before approving` : "AI draft — review before approving";
+          Object.assign(target, { value, source: "ai", needsReview: true, note } satisfies Partial<PreparedAnswer>);
           aiAnswered++;
         }
       } else note = res.message;

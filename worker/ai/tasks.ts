@@ -100,6 +100,7 @@ export async function aiTailorResume(
   userId: string,
   resume: BaseResume,
   job: { title: string; company: string; keywords: string[]; description: string },
+  applicationId?: string,
 ): Promise<AiResult<AiTailorOutput>> {
   const experience = resume.experience.map((e) => ({
     id: e.id,
@@ -109,6 +110,7 @@ export async function aiTailorResume(
   return runJson(env, {
     userId,
     task: "resume_tailor",
+    applicationId,
     model: env.AI_MODEL_QUALITY,
     maxTokens: 2200,
     temperature: 0.2,
@@ -166,6 +168,7 @@ export async function aiAnswerQuestions(
   userId: string,
   questions: FormField[],
   context: { candidate: string; job: string },
+  applicationId?: string,
 ): Promise<AiResult<z.infer<typeof AnswersSchema>>> {
   const qs = questions.map((q) => ({
     key: q.key,
@@ -176,6 +179,7 @@ export async function aiAnswerQuestions(
   return runJson(env, {
     userId,
     task: "form_answers",
+    applicationId,
     model: env.AI_MODEL_QUALITY,
     maxTokens: 1500,
     schema: AnswersSchema,

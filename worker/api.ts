@@ -10,6 +10,7 @@ import { CATALOG } from "../shared/catalog";
 import { normalizeToken, probeBoard, sourceId } from "./discovery/crawl";
 import { detectSource } from "./discovery/detect";
 import { dev } from "./dev";
+import { refreshQuality, type StoredQuality } from "./apply/quality-store";
 import { digestData, emailConfigured, renderDigest } from "./email/digest";
 import { SourceError } from "./discovery/types";
 import { canTransition, createApplication, getApplication, logEvent, transition } from "./db/applications";
@@ -33,7 +34,7 @@ import { errorMessage, HttpError, monthKey, now, safeJson } from "./lib/util";
 import { renderResumeDocx } from "./resume/docx";
 import { importResume } from "./resume/import";
 import { renderResumePdf } from "./resume/pdf";
-import { effectiveMode, SUBMIT_ADAPTERS } from "./workflows/submit";
+import { duplicateReason, effectiveMode, SUBMIT_ADAPTERS } from "./workflows/submit";
 
 type Vars = { userId: string; email: string };
 const api = new Hono<{ Bindings: Env; Variables: Vars }>().basePath("/api");
@@ -652,12 +653,17 @@ api.get("/applications/:id", async (c) => {
     error: app.error,
     notes: app.notes,
     hasScreenshot: !!app.screenshot_key,
+    clicked: !!app.clicked_at,
     hasResume: !!app.resume_pdf_key,
     createdAt: app.created_at,
     updatedAt: app.updated_at,
     answers: await decryptJson<PreparedAnswer[]>(keyring(c.env), app.answers_enc, []),
     missing: safeJson<string[]>(app.missing_json, []),
     form: safeJson<FormField[]>(app.form_json, []),
+    quality:
+      safeJson<StoredQuality | null>(app.quality_json, null)?.report ??
+      // Applications prepared before quality reports existed get one on first view.
+      (app.answers_enc && ["prepared", "needs_manual", "failed"].includes(app.status) ? (await refreshQuality(c.env, app, { withResume: true })).report : null),
     tailored,
     job,
     events: events.results,
@@ -708,6 +714,7 @@ api.put("/applications/:id/answers", async (c) => {
       app.id,
     )
     .run();
+  const quality = await refreshQuality(c.env, app, { answers });
 
   if (input.saveToLibrary && changed.length) {
     const profile = await getProfile(c.env, userId);
@@ -722,7 +729,7 @@ api.put("/applications/:id/answers", async (c) => {
     }
     await saveAnswers(c.env, userId, library);
   }
-  return c.json({ ok: true, missing });
+  return c.json({ ok: true, missing, quality: quality.report });
 });
 
 const AnswerUpdates = z.array(z.object({ key: z.string().max(100), value: z.union([z.string().max(8000), z.array(z.string().max(500)).max(30)]) })).max(200);
@@ -731,7 +738,14 @@ const AnswerUpdates = z.array(z.object({ key: z.string().max(100), value: z.unio
  * Approve one prepared application. The confirmation dialog in the UI is the review step:
  * final answers are saved and marked reviewed, then the submit workflow starts.
  */
-async function approveApplication(env: Env, userId: string, appId: string, requested: "dry_run" | "live", updates?: z.infer<typeof AnswerUpdates>) {
+async function approveApplication(
+  env: Env,
+  userId: string,
+  appId: string,
+  requested: "dry_run" | "live",
+  updates?: z.infer<typeof AnswerUpdates>,
+  confirmNotSubmitted = false,
+) {
   const app = await getApplication(env, userId, appId);
   if (app.status !== "prepared") throw new HttpError(409, `Application must be ready for review first (currently ${app.status})`);
   if (!SUBMIT_ADAPTERS.has(app.adapter ?? "")) throw new HttpError(409, "This job board can't be submitted automatically; use assisted apply and mark it submitted");
@@ -747,9 +761,12 @@ async function approveApplication(env: Env, userId: string, appId: string, reque
   }
   const missing = missingRequired(answers);
   if (missing.length) throw new HttpError(409, `Fill the required fields first: ${missing.join("; ")}`);
+  const quality = await refreshQuality(env, app, { answers });
+  const blockers = quality.report.checks.filter((q) => !q.ok && q.severity === "block");
+  if (blockers.length) throw new HttpError(409, `Fix before approving: ${blockers.map((b) => (b.field ? `${b.field}: ${b.message}` : b.message)).join("; ")}`);
 
   const profile = await getProfile(env, userId);
-  const mode = effectiveMode(env, requested, profile.settings.liveSubmitEnabled);
+  const mode = effectiveMode(env, requested, profile.settings.liveSubmitEnabled, app.adapter);
   if (requested === "live" && mode !== "live") {
     throw new HttpError(
       409,
@@ -758,6 +775,11 @@ async function approveApplication(env: Env, userId: string, appId: string, reque
         : "Enable live submission in settings first.",
     );
   }
+  if (mode === "live") {
+    // Fail fast with a clear message (the submit workflow re-checks atomically).
+    const dup = await duplicateReason(env, app, false);
+    if (dup && !(confirmNotSubmitted && !dup.startsWith("Duplicate"))) throw new HttpError(409, dup);
+  }
   await env.DB.prepare("UPDATE applications SET answers_enc = ?, missing_json = '[]', error = NULL WHERE id = ?")
     .bind(await encryptJson(keyring(env), answers), app.id)
     .run();
@@ -765,7 +787,7 @@ async function approveApplication(env: Env, userId: string, appId: string, reque
   if (!ok) throw new HttpError(409, "Application changed; reload and try again");
   const instanceId = `submit-${app.id}-${app.submit_attempts + 1}`;
   try {
-    await env.SUBMIT_WORKFLOW.create({ id: instanceId, params: { applicationId: app.id, userId, mode } });
+    await env.SUBMIT_WORKFLOW.create({ id: instanceId, params: { applicationId: app.id, userId, mode, confirmNotSubmitted } });
   } catch (e) {
     if (!/already exists/i.test(errorMessage(e))) {
       await transition(env, app, ["approved"], "prepared", "Could not start submission workflow");
@@ -777,8 +799,11 @@ async function approveApplication(env: Env, userId: string, appId: string, reque
 }
 
 api.post("/applications/:id/approve", async (c) => {
-  const input = await body(c, z.object({ mode: z.enum(["dry_run", "live"]), confirm: z.literal(true), answers: AnswerUpdates.optional() }));
-  return c.json({ ok: true, ...(await approveApplication(c.env, c.get("userId"), c.req.param("id"), input.mode, input.answers)) });
+  const input = await body(
+    c,
+    z.object({ mode: z.enum(["dry_run", "live"]), confirm: z.literal(true), answers: AnswerUpdates.optional(), confirmNotSubmitted: z.boolean().catch(false) }),
+  );
+  return c.json({ ok: true, ...(await approveApplication(c.env, c.get("userId"), c.req.param("id"), input.mode, input.answers, input.confirmNotSubmitted)) });
 });
 
 /**
@@ -815,6 +840,12 @@ api.post("/applications/:id/status", async (c) => {
   const app = await getApplication(c.env, userId, c.req.param("id"));
   if (!canTransition(app.status, input.status)) throw new HttpError(409, `Cannot move from ${app.status} to ${input.status}`);
   const extra: Record<string, number | null> = input.status === "submitted" && !app.submitted_at ? { submitted_at: now() } : {};
+  if (input.status === "submitted") {
+    // Applied by hand: lock the role so automation never submits it again.
+    await c.env.DB.prepare("INSERT OR IGNORE INTO submission_locks (user_id, dedupe_key, application_id, locked_at) VALUES (?, ?, ?, ?)")
+      .bind(userId, app.dedupe_key, app.id, now())
+      .run();
+  }
   const ok = await transition(c.env, app, [app.status], input.status, input.note || `Marked ${input.status}`, extra);
   if (!ok) throw new HttpError(409, "Application changed; reload and try again");
   return c.json({ ok: true });
@@ -875,6 +906,79 @@ api.get("/usage", async (c) => {
   return c.json({ summary, projectedUsd: projected, byTask: byTask.results, recent: recent.results, months: months.results });
 });
 
+// ---------------- monitoring ----------------
+
+api.get("/metrics", async (c) => {
+  const userId = c.get("userId");
+  const days = Math.min(90, Math.max(1, Number(c.req.query("days") ?? 30) || 30));
+  const since = now() - days * 24 * 3600 * 1000;
+  const [crawl, prepare, submit, daily, aiTotals, perApp, sharedAi] = await Promise.all([
+    // Crawls of the boards this user follows.
+    c.env.DB.prepare(
+      `SELECT r.status, COUNT(*) AS n, AVG(r.duration_ms) AS avg_ms FROM runs r
+       WHERE r.kind = 'crawl' AND r.created_at > ? AND r.ref_id IN (SELECT source_id FROM user_sources WHERE user_id = ?) GROUP BY r.status`,
+    )
+      .bind(since, userId)
+      .all<{ status: string; n: number; avg_ms: number | null }>(),
+    c.env.DB.prepare("SELECT status, COUNT(*) AS n, AVG(duration_ms) AS avg_ms FROM runs WHERE kind = 'prepare' AND user_id = ? AND created_at > ? GROUP BY status")
+      .bind(userId, since)
+      .all<{ status: string; n: number; avg_ms: number | null }>(),
+    c.env.DB.prepare("SELECT status, metrics_json FROM runs WHERE kind = 'submit' AND user_id = ? AND created_at > ?").bind(userId, since).all<{ status: string; metrics_json: string | null }>(),
+    c.env.DB.prepare(
+      `SELECT date(created_at / 1000, 'unixepoch') AS day, kind, status, COUNT(*) AS n FROM runs
+       WHERE user_id = ? AND created_at > ? AND kind IN ('prepare','submit') GROUP BY day, kind, status ORDER BY day`,
+    )
+      .bind(userId, since)
+      .all<{ day: string; kind: string; status: string; n: number }>(),
+    c.env.DB.prepare("SELECT task, SUM(cost_usd) AS cost, COUNT(*) AS calls FROM ai_usage WHERE user_id = ? AND created_at > ? GROUP BY task").bind(userId, since).all<{ task: string; cost: number; calls: number }>(),
+    c.env.DB.prepare(
+      `SELECT COUNT(DISTINCT application_id) AS apps, COALESCE(SUM(cost_usd), 0) AS cost FROM ai_usage
+       WHERE user_id = ? AND created_at > ? AND application_id IS NOT NULL`,
+    )
+      .bind(userId, since)
+      .first<{ apps: number; cost: number }>(),
+    c.env.DB.prepare("SELECT COALESCE(SUM(cost_usd), 0) AS cost FROM ai_usage WHERE user_id = ? AND created_at > ? AND application_id IS NULL")
+      .bind(userId, since)
+      .first<{ cost: number }>(),
+  ]);
+
+  const rate = (rows: { status: string; n: number }[], okStatuses: string[]) => {
+    const total = rows.reduce((a, r) => a + r.n, 0);
+    const ok = rows.filter((r) => okStatuses.includes(r.status)).reduce((a, r) => a + r.n, 0);
+    return { total, ok, rate: total ? ok / total : null };
+  };
+  // Form filling: fields filled vs failed across browser runs, and the most common failing fields.
+  let filled = 0;
+  let failed = 0;
+  const failingFields = new Map<string, number>();
+  const outcomes: Record<string, number> = {};
+  for (const r of submit.results) {
+    outcomes[r.status] = (outcomes[r.status] ?? 0) + 1;
+    const m = safeJson<{ filled?: number; failed?: number; failedFields?: string[] }>(r.metrics_json, {});
+    filled += m.filled ?? 0;
+    failed += m.failed ?? 0;
+    for (const f of m.failedFields ?? []) failingFields.set(f, (failingFields.get(f) ?? 0) + 1);
+  }
+  const preparedOk = prepare.results.find((r) => r.status === "ok")?.n ?? 0;
+  const appAi = perApp?.cost ?? 0;
+  const shared = sharedAi?.cost ?? 0;
+  return c.json({
+    days,
+    discovery: { ...rate(crawl.results, ["ok", "partial"]), byStatus: crawl.results },
+    preparation: { ...rate(prepare.results, ["ok"]), avgMs: prepare.results.find((r) => r.status === "ok")?.avg_ms ?? null },
+    formFill: { filled, failed, rate: filled + failed ? filled / (filled + failed) : null, topFailing: [...failingFields.entries()].sort((a, b) => b[1] - a[1]).slice(0, 8) },
+    submission: { outcomes, ...rate(submit.results.map((r) => ({ status: r.status, n: 1 })), ["submitted", "dry_run_ok"]) },
+    ai: {
+      byTask: aiTotals.results,
+      total: appAi + shared,
+      perApplication: perApp?.apps ? appAi / perApp.apps : null,
+      // Shared work (job analysis, matching) spread over prepared applications.
+      allInPerPrepared: preparedOk ? (appAi + shared) / preparedOk : null,
+    },
+    daily: daily.results,
+  });
+});
+
 // ---------------- data export / deletion ----------------
 
 api.get("/export", async (c) => {
@@ -906,6 +1010,8 @@ api.delete("/account", async (c) => {
     c.env.DB.prepare("DELETE FROM user_sources WHERE user_id = ?").bind(userId),
     c.env.DB.prepare("DELETE FROM ai_usage WHERE user_id = ?").bind(userId),
     c.env.DB.prepare("DELETE FROM ai_budget WHERE user_id = ?").bind(userId),
+    c.env.DB.prepare("DELETE FROM submission_locks WHERE user_id = ?").bind(userId),
+    c.env.DB.prepare("DELETE FROM runs WHERE user_id = ?").bind(userId),
     c.env.DB.prepare("DELETE FROM profiles WHERE user_id = ?").bind(userId),
     c.env.DB.prepare("DELETE FROM users WHERE id = ?").bind(userId),
   ]);

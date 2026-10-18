@@ -15,6 +15,7 @@ const PRICES: Record<string, { input: number; output: number }> = {
   "@cf/openai/gpt-oss-120b": { input: 0.35, output: 0.75 },
   "@cf/zai-org/glm-4.7-flash": { input: 0.06, output: 0.4 },
   "@cf/ibm-granite/granite-4.0-h-micro": { input: 0.017, output: 0.112 },
+  "@cf/baai/bge-small-en-v1.5": { input: 0.02, output: 0 },
 };
 
 const FALLBACK = { input: 1.0, output: 4.0 };

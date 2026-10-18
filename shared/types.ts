@@ -181,7 +181,10 @@ export interface JobAnalysis {
 
 export interface MatchBreakdown {
   skills: number;
+  /** Semantic resume↔job similarity (embeddings); null when unavailable. Older matches lack it. */
+  semantic?: number | null;
   title: number;
+  experience?: number;
   seniority: number;
   location: number;
   salary: number;
