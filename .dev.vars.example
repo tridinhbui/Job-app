@@ -1,0 +1,6 @@
+# Copy to .dev.vars for local development.
+AUTH_MODE=dev
+DEV_USER_EMAIL=you@example.com
+SUBMIT_MODE=dry_run
+# openssl rand -base64 32
+DATA_ENCRYPTION_KEY=

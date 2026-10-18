@@ -1,0 +1,78 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "applypilot",
+  "main": "worker/index.ts",
+  "compatibility_date": "2026-10-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": { "enabled": true },
+  "upload_source_maps": true,
+
+  // SPA navigations are served straight from static assets (no Worker invocation, no cost).
+  // Only /api/* runs the Worker.
+  "assets": {
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*"]
+  },
+
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "applypilot",
+      // Replaced by scripts/setup-cloudflare.sh (any value works for local dev).
+      "database_id": "0b4f9d75-89e4-41d3-87bd-43c4d26ec1d1",
+      "migrations_dir": "migrations"
+    }
+  ],
+
+  "r2_buckets": [{ "binding": "FILES", "bucket_name": "applypilot-files" }],
+
+  "queues": {
+    "producers": [{ "binding": "JOBS_QUEUE", "queue": "applypilot-jobs" }],
+    "consumers": [
+      {
+        "queue": "applypilot-jobs",
+        "max_batch_size": 5,
+        "max_batch_timeout": 5,
+        "max_retries": 3,
+        "dead_letter_queue": "applypilot-jobs-dlq"
+      }
+    ]
+  },
+
+  "workflows": [
+    {
+      "name": "applypilot-prepare",
+      "binding": "PREPARE_WORKFLOW",
+      "class_name": "PrepareApplicationWorkflow",
+      "default_retention": { "success_retention": "3 days", "error_retention": "7 days" }
+    },
+    {
+      "name": "applypilot-submit",
+      "binding": "SUBMIT_WORKFLOW",
+      "class_name": "SubmitApplicationWorkflow",
+      "default_retention": { "success_retention": "7 days", "error_retention": "14 days" }
+    }
+  ],
+
+  "ai": { "binding": "AI", "remote": true },
+  "browser": { "binding": "BROWSER" },
+
+  "triggers": {
+    // :00 every 6h -> crawl sources; :45 -> match new jobs for users; 03:17 daily -> cleanup.
+    "crons": ["0 */6 * * *", "45 */6 * * *", "17 3 * * *"]
+  },
+
+  "vars": {
+    // "access" validates the Cloudflare Access JWT. "dev" trusts DEV_USER_EMAIL (local only).
+    "AUTH_MODE": "access",
+    "ACCESS_TEAM_DOMAIN": "",
+    "ACCESS_AUD": "",
+    // "dry_run" fills forms but never clicks submit. Must be set to "live" deliberately,
+    // AND the user must enable live submission in Settings, AND approve each application.
+    "SUBMIT_MODE": "dry_run",
+    "AI_MODEL_FAST": "@cf/meta/llama-3.1-8b-instruct-fp8-fast",
+    "AI_MODEL_QUALITY": "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+    "AI_GATEWAY_ID": "",
+    "DEFAULT_MONTHLY_BUDGET_USD": "10"
+  }
+}
